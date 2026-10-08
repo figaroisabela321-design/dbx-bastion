@@ -2225,6 +2225,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "chrono",
+ "hex",
  "rand_core 0.6.4",
  "rusqlite",
  "serde",

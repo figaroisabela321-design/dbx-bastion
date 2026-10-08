@@ -65,4 +65,39 @@ pub enum BastionError {
 
     #[error("dbx connection adapter unavailable: {0}")]
     AdapterUnavailable(String),
+
+    /// The SQL policy denied the statement (with the policy reason code).
+    /// The database was never touched; audited as `blocked`.
+    #[error("sql policy denied: {0}")]
+    PolicyDenied(String),
+
+    /// Policy returned `RequireApproval` but the approval service does not
+    /// exist yet: denied, never executed.
+    #[error("approval required: no approval service in V1")]
+    ApprovalRequired,
+
+    /// Production assets do not execute in TASK-005B, even for reads.
+    #[error("production execution is disabled in V1")]
+    ProductionDenied,
+
+    /// The audit store was unavailable before execution: fail-closed, the
+    /// executor was never called.
+    #[error("audit unavailable: {0}")]
+    AuditUnavailable(String),
+
+    /// Untriaged `unknown_interrupted` audit records exist (or a local
+    /// audit failure occurred): the gateway refuses new executions until
+    /// an operator triages.
+    #[error("audit fail-closed: untriaged interrupted executions exist")]
+    AuditFailClosed,
+
+    #[error("execution timed out")]
+    ExecutionTimeout,
+
+    #[error("execution was cancelled")]
+    ExecutionCancelled,
+
+    /// The executor failed; the audit record keeps the failure.
+    #[error("execution failed: {0}")]
+    ExecutorFailed(String),
 }

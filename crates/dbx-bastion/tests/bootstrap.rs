@@ -109,7 +109,13 @@ async fn fresh_init_creates_schema_and_records_version() {
     }
     assert_eq!(
         applied_versions(&conn),
-        vec!["0001_init".to_string(), "0002_auth".to_string(), "0003_assets".to_string(), "0004_rbac".to_string()]
+        vec![
+            "0001_init".to_string(),
+            "0002_auth".to_string(),
+            "0003_assets".to_string(),
+            "0004_rbac".to_string(),
+            "0005_audit".to_string()
+        ]
     );
 
     let foreign_keys: i64 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0)).unwrap();
@@ -155,7 +161,7 @@ async fn migration_is_idempotent_and_preserves_data() {
     }
 
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(applied_versions(&conn).len(), 4, "migration versions must not be recorded twice");
+    assert_eq!(applied_versions(&conn).len(), 5, "migration versions must not be recorded twice");
     drop(conn);
     cleanup(&path);
 }

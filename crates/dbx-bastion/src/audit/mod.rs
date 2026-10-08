@@ -31,6 +31,9 @@ use crate::error::Result;
 use crate::policy::RiskLevel;
 use crate::query::analyzer::StatementAction;
 
+pub mod sqlite;
+pub use sqlite::{redact_sql, SqliteAuditService};
+
 /// Audit lifecycle states. See module docs for the fail-closed rules
 /// attached to each transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

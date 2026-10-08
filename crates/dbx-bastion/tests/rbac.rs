@@ -1066,7 +1066,7 @@ fn migration_0004_fresh_init() {
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
-    assert_eq!(versions, vec!["0001_init", "0002_auth", "0003_assets", "0004_rbac"]);
+    assert_eq!(versions, vec!["0001_init", "0002_auth", "0003_assets", "0004_rbac", "0005_audit"]);
     for table in ["user_groups", "user_group_members", "group_roles"] {
         let count: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM sqlite_master WHERE name = '{table}'"), [], |row| row.get(0))
