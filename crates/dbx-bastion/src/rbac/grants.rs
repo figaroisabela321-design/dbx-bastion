@@ -107,7 +107,7 @@ pub struct GrantService {
 
 impl GrantService {
     pub fn new(store: Arc<SqliteStore>, clock: Arc<dyn Clock>) -> Self {
-        Self { guard: AssetAdminGuard::new(store.clone()), store, clock }
+        Self { guard: AssetAdminGuard::new(store.clone(), clock.clone()), store, clock }
     }
 
     fn now(&self) -> DateTime<Utc> {

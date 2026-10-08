@@ -82,12 +82,14 @@ enum MatchOutcome {
 }
 
 /// Consistency snapshot for one authorization batch. See module docs.
+///
+/// The snapshot is always built for one principal by the storage loader;
+/// the session_id <-> user_id binding is enforced there at runtime
+/// (release-effective): a session that does not belong to the user
+/// yields `session_valid == false` and every decision denies. No
+/// debug-only assertion is relied upon for this binding.
 #[derive(Debug, Clone)]
 pub(crate) struct AuthSnapshot {
-    /// The principal this snapshot was built for. Checked with
-    /// `debug_assert_eq!` by the authorizer: a snapshot built for the
-    /// wrong principal must never be evaluated.
-    pub user_id: Uuid,
     /// Re-validated inside the snapshot transaction: session row exists,
     /// not revoked, not expired. A session revoked after
     /// [`AuthenticatedPrincipal`](crate::auth::AuthenticatedPrincipal)
@@ -247,7 +249,6 @@ mod tests {
 
     fn base_snapshot(asset_id: Uuid) -> AuthSnapshot {
         AuthSnapshot {
-            user_id: Uuid::new_v4(),
             session_valid: true,
             user_enabled: true,
             rules: vec![],

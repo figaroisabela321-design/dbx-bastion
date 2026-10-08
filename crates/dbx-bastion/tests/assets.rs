@@ -359,6 +359,31 @@ async fn disabled_admin_cannot_manage_assets() {
     assert!(matches!(err, BastionError::AuthenticationFailed), "disabled admin must be rejected, got {err:?}");
 }
 
+#[tokio::test]
+async fn revoked_session_cannot_manage_assets() {
+    // The guard re-validates the session row on every call: a session
+    // revoked after the principal was issued retains no administrative
+    // power (release-effective, not debug-only).
+    let ctx = Ctx::new("revoked-admin").await;
+    let admin = ctx.make_admin("assetadmin").await;
+    ctx.assets().create_asset(&admin, ctx.new_asset("before")).await.unwrap();
+
+    ctx.service.auth().sessions().revoke_session(admin.session_id()).await.unwrap();
+
+    let err = ctx.assets().create_asset(&admin, ctx.new_asset("after")).await.unwrap_err();
+    assert!(matches!(err, BastionError::AuthenticationFailed), "revoked session must lose admin power, got {err:?}");
+    // Grant administration is guarded the same way.
+    let grants = dbx_bastion::rbac::GrantService::new(
+        ctx.service.store().clone(),
+        std::sync::Arc::new(dbx_bastion::auth::session::SystemClock),
+    );
+    let err = grants.create_role(&admin, "nope", "").await.unwrap_err();
+    assert!(
+        matches!(err, BastionError::AuthenticationFailed),
+        "revoked session must lose grant-admin power, got {err:?}"
+    );
+}
+
 // ---- 5/6. credential-free surfaces --------------------------------------------
 
 #[tokio::test]

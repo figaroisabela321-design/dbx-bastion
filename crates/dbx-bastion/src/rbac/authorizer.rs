@@ -136,9 +136,10 @@ impl Authorizer for SnapshotAuthorizer {
             .store
             .authorization_snapshot(principal.user_id(), principal.session_id(), &actions, self.clock.clone())
             .await?;
-        // The snapshot must belong to the principal being evaluated; a
-        // mix-up here would be an authorization bypass.
-        debug_assert_eq!(snapshot.user_id, principal.user_id());
+        // Identity binding is enforced inside the snapshot loader at
+        // runtime (release-effective): the session row must belong to
+        // `principal.user_id()`, otherwise `session_valid` is false and
+        // every check denies. No debug-only assertion is relied upon.
         Ok(checks.iter().map(|check| snapshot.decide(check)).collect())
     }
 }

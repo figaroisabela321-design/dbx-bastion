@@ -37,22 +37,30 @@ use crate::storage::SqliteStore;
 /// future RBAC evaluator (P3).
 pub struct AssetAdminGuard {
     store: Arc<SqliteStore>,
+    clock: Arc<dyn Clock>,
 }
 
 impl AssetAdminGuard {
-    pub fn new(store: Arc<SqliteStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<SqliteStore>, clock: Arc<dyn Clock>) -> Self {
+        Self { store, clock }
     }
 
     /// Verify the caller is an enabled platform asset administrator.
     /// Returns the verified user id.
     ///
     /// The identity comes from [`AuthenticatedPrincipal`] (unforgeable,
-    /// session-validated); enabled flag and roles are re-read from the
-    /// database on every call, so revocation applies immediately.
+    /// session-validated at issuance); the enabled flag, the **session
+    /// row itself** (revoked/expired/belongs-to-user) and roles are
+    /// re-read from the database on every call, so disable, session
+    /// revocation and role removal all take effect immediately. A
+    /// revoked session retains no administrative power even if the
+    /// caller still holds the previously issued principal.
     pub async fn check(&self, principal: &AuthenticatedPrincipal) -> Result<Uuid> {
         let user = self.store.find_user_by_id(principal.user_id()).await?.ok_or(BastionError::AuthenticationFailed)?;
         if !user.enabled {
+            return Err(BastionError::AuthenticationFailed);
+        }
+        if !self.store.session_active_for_user(principal.session_id(), principal.user_id(), self.clock.now()).await? {
             return Err(BastionError::AuthenticationFailed);
         }
         let roles = self.store.user_role_names(user.id).await?;
@@ -76,7 +84,7 @@ impl AssetService {
     }
 
     pub fn with_clock(store: Arc<SqliteStore>, dbx: Arc<dyn DbxConnectionAdapter>, clock: Arc<dyn Clock>) -> Self {
-        Self { guard: AssetAdminGuard::new(store.clone()), store, dbx, clock }
+        Self { guard: AssetAdminGuard::new(store.clone(), clock.clone()), store, dbx, clock }
     }
 
     pub fn guard(&self) -> &AssetAdminGuard {

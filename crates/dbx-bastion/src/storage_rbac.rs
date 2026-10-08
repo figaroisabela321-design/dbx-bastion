@@ -43,6 +43,40 @@ impl SqliteStore {
         self.in_read_transaction(move |tx| Self::load_snapshot_in(tx, user_id, session_id, &actions, &clock)).await
     }
 
+    /// Lightweight session re-validation for the management plane
+    /// ([`AssetAdminGuard`](crate::asset::service::AssetAdminGuard)).
+    ///
+    /// Same semantics as the `session_valid` bit in
+    /// [`Self::authorization_snapshot`]: the session row must exist,
+    /// belong to `user_id`, be unrevoked and unexpired at `now`. A
+    /// revoked or expired session retains no administrative power, even
+    /// if the caller still holds a previously issued
+    /// [`AuthenticatedPrincipal`](crate::auth::AuthenticatedPrincipal).
+    pub(crate) async fn session_active_for_user(
+        &self,
+        session_id: Uuid,
+        user_id: Uuid,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        self.blocking(move |conn| {
+            let row: Option<(String, Option<String>, String)> = conn
+                .query_row(
+                    "SELECT user_id, revoked_at, expires_at FROM sessions WHERE id = ?1",
+                    [session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            Ok(row
+                .map(|(session_user, revoked_at, expires_at)| {
+                    session_user == user_id.to_string()
+                        && revoked_at.is_none()
+                        && expires_at.parse::<chrono::DateTime<chrono::Utc>>().map(|t| t > now).unwrap_or(false)
+                })
+                .unwrap_or(false))
+        })
+        .await
+    }
+
     /// Paginated asset listing restricted to CONNECT-authorized assets.
     ///
     /// The snapshot, the authorized-id computation, the filtered query and
@@ -125,15 +159,24 @@ impl SqliteStore {
         let uid = user_id.to_string();
         let sid = session_id.to_string();
 
+        // Identity binding, enforced at runtime (effective in release
+        // builds, not just debug_assert): the session row must belong to
+        // the user this snapshot is built for. Roles and grants below are
+        // loaded by `user_id`; without this check a mismatched
+        // (user_id, session_id) pair would evaluate one user's grants
+        // against another user's session validity — a confused-deputy
+        // hole. Any mismatch fails closed via `session_valid = false`.
         let session_valid: bool = tx
-            .query_row("SELECT revoked_at, expires_at FROM sessions WHERE id = ?1", [&sid], |row| {
-                let revoked_at: Option<String> = row.get(0)?;
-                let expires_at: String = row.get(1)?;
-                Ok((revoked_at, expires_at))
+            .query_row("SELECT user_id, revoked_at, expires_at FROM sessions WHERE id = ?1", [&sid], |row| {
+                let session_user: String = row.get(0)?;
+                let revoked_at: Option<String> = row.get(1)?;
+                let expires_at: String = row.get(2)?;
+                Ok((session_user, revoked_at, expires_at))
             })
             .optional()?
-            .map(|(revoked_at, expires_at)| {
-                revoked_at.is_none()
+            .map(|(session_user, revoked_at, expires_at)| {
+                session_user == uid
+                    && revoked_at.is_none()
                     && expires_at.parse::<chrono::DateTime<chrono::Utc>>().map(|t| t > now).unwrap_or(false)
             })
             .unwrap_or(false);
@@ -283,7 +326,7 @@ impl SqliteStore {
             }
         }
 
-        Ok(AuthSnapshot { user_id, session_valid, user_enabled, rules, assets, group_children, asset_groups, now })
+        Ok(AuthSnapshot { session_valid, user_enabled, rules, assets, group_children, asset_groups, now })
     }
 
     // ---- grants ----------------------------------------------------------
@@ -548,5 +591,95 @@ impl SqliteStore {
             Ok(())
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::session::SystemClock;
+    use crate::rbac::resource::ResourceScope;
+    use crate::rbac::AuthorizationCheck;
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("dbx-bastion-snapshot-bind-{}-{tag}.db", std::process::id()))
+    }
+
+    fn rfc3339(dt: chrono::DateTime<chrono::Utc>) -> String {
+        dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// The session_id <-> user_id binding inside the snapshot loader is a
+    /// runtime check, effective in release builds (not a `debug_assert`):
+    /// a snapshot built for user B with user A's session must report
+    /// `session_valid == false` and deny, even when B holds a grant.
+    #[tokio::test]
+    async fn snapshot_session_user_binding_is_release_effective() {
+        let path = temp_path("mismatch");
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path).unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+        let user_a = Uuid::new_v4();
+        let user_b = Uuid::new_v4();
+        let session_a = Uuid::new_v4();
+        let session_b = Uuid::new_v4();
+        let role = Uuid::new_v4();
+        let asset = Uuid::new_v4();
+
+        let now = chrono::Utc::now();
+        let created = rfc3339(now);
+        let expires = rfc3339(now + chrono::Duration::hours(1));
+
+        store
+            .blocking(move |conn| {
+                for (uid, name) in [(user_a, "a"), (user_b, "b")] {
+                    conn.execute(
+                        "INSERT INTO users (id, username, display_name, password_hash, enabled)
+                         VALUES (?1, ?2, ?2, 'x', 1)",
+                        rusqlite::params![uid.to_string(), name],
+                    )?;
+                }
+                for (sid, uid) in [(session_a, user_a), (session_b, user_b)] {
+                    conn.execute(
+                        "INSERT INTO sessions (id, user_id, token_hash, created_at, expires_at, revoked_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                        rusqlite::params![sid.to_string(), uid.to_string(), format!("hash-{sid}"), created, expires],
+                    )?;
+                }
+                conn.execute("INSERT INTO roles (id, name) VALUES (?1, 'r')", [role.to_string()])?;
+                conn.execute(
+                    "INSERT INTO user_roles (user_id, role_id) VALUES (?1, ?2)",
+                    rusqlite::params![user_b.to_string(), role.to_string()],
+                )?;
+                conn.execute(
+                    "INSERT INTO assets (id, name, environment, db_type, dbx_connection_id, enabled)
+                     VALUES (?1, 'x', 'development', 'mysql', 'conn-x', 1)",
+                    [asset.to_string()],
+                )?;
+                conn.execute(
+                    "INSERT INTO permissions (id, role_id, effect, action, asset_id, asset_group_id)
+                     VALUES (?1, ?2, 'allow', 'connect', ?3, NULL)",
+                    rusqlite::params![Uuid::new_v4().to_string(), role.to_string(), asset.to_string()],
+                )?;
+                Ok::<_, BastionError>(())
+            })
+            .await
+            .unwrap();
+
+        let check = AuthorizationCheck::new(ResourceScope::asset(asset), Action::Connect);
+
+        // Mismatched pair: user B's grants, user A's session -> denied.
+        let mismatched =
+            store.authorization_snapshot(user_b, session_a, &[Action::Connect], clock.clone()).await.unwrap();
+        assert!(!mismatched.session_valid, "session of another user must not validate");
+        assert!(!mismatched.decide(&check), "mismatched identity must deny even with a grant");
+
+        // Control: matched pair authorizes.
+        let matched = store.authorization_snapshot(user_b, session_b, &[Action::Connect], clock.clone()).await.unwrap();
+        assert!(matched.session_valid);
+        assert!(matched.decide(&check));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
