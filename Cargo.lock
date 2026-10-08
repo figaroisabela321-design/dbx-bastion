@@ -2219,6 +2219,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbx-bastion"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "dbx-cli"
 version = "0.4.109"
 dependencies = [

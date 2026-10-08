@@ -1,0 +1,26 @@
+[package]
+name = "dbx-bastion"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "DB Bastion security domain: auth/session principals, assets, RBAC, SQL policy, approvals, audit and the query gateway boundary. Storage is isolated from DBX core."
+
+[dependencies]
+# Same rusqlite line as the DBX workspace (0.32) plus `bundled` so this crate
+# builds standalone (`cargo check -p dbx-bastion`) without system sqlite3
+# headers. `bundled` does not conflict with dbx-core's
+# `bundled-sqlcipher-vendored-openssl`: that feature already implies `bundled`.
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Tests assert on sqlite_master directly through the same rusqlite version.
+rusqlite = { version = "0.32", features = ["bundled"] }
