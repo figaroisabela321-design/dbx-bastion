@@ -35,6 +35,10 @@ pub enum PolicyReason {
     /// Analyzer could not be applied (defensive; the analyzer itself
     /// rejects these first).
     Unanalyzable,
+    /// A table reference has an unresolvable identity level (e.g. a
+    /// PostgreSQL schema left to `search_path`). Never authorize on a
+    /// guess: V1 requires explicit qualification.
+    UnresolvedIdentity,
     /// More than one statement (defensive; the analyzer rejects first).
     MultiStatement,
     /// `SELECT INTO`, locking reads, or unknown/non-pure functions:
@@ -65,6 +69,7 @@ impl PolicyReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unanalyzable => "unanalyzable_sql",
+            Self::UnresolvedIdentity => "unresolved_identity",
             Self::MultiStatement => "multi_statement",
             Self::SideEffectSelect => "side_effect_select",
             Self::MissingWhere => "missing_where",
@@ -106,6 +111,12 @@ impl SqlPolicy {
             return PolicyDecision::Deny(PolicyReason::MultiStatement);
         }
         let stmt = &statements[0];
+        // Unresolvable object identity: deny before RBAC, where a
+        // wildcard rule would match an Unknown level while a
+        // table-level DENY on the real schema would not fire.
+        if stmt.targets.iter().chain(stmt.sources.iter()).any(|t| t.has_unknown_level()) {
+            return PolicyDecision::Deny(PolicyReason::UnresolvedIdentity);
+        }
         // Non-pure reads never pass as ordinary SELECTs, in any
         // environment — including production read-only.
         if stmt.has_side_effects {

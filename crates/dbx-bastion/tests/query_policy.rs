@@ -47,7 +47,7 @@ fn prod_dml_requires_approval_therefore_never_executes() {
 fn prod_side_effect_select_denied() {
     // Not a pure read: denied even in production, not RequireApproval.
     assert_eq!(
-        decide("SELECT * FROM orders FOR UPDATE", SqlDialect::Postgres, PROD),
+        decide("SELECT * FROM public.orders FOR UPDATE", SqlDialect::Postgres, PROD),
         PolicyDecision::Deny(PolicyReason::SideEffectSelect)
     );
     assert_eq!(
@@ -112,7 +112,7 @@ fn ddl_grant_merge_procedure_transaction_denied() {
 #[test]
 fn select_into_denied_as_side_effect() {
     assert_eq!(
-        decide("SELECT * INTO t2 FROM orders", SqlDialect::SqlServer, DEV),
+        decide("SELECT * INTO dbo.t2 FROM dbo.orders", SqlDialect::SqlServer, DEV),
         PolicyDecision::Deny(PolicyReason::SideEffectSelect)
     );
 }
@@ -129,4 +129,55 @@ fn unanalyzable_sql_never_reaches_policy() {
         });
         assert!(res.is_err(), "{sql:?} must fail analysis, got {res:?}");
     }
+}
+
+// ---- security fix: unresolved identity -----------------------------------------
+
+#[test]
+fn unqualified_schema_is_denied_before_rbac() {
+    // PostgreSQL: the schema is unknowable (search_path), so the policy
+    // denies outright. This is what stops a table-level DENY from being
+    // bypassed by omitting the schema: the statement never reaches RBAC,
+    // where a wildcard ALLOW would match the Unknown level while the
+    // DENY on the real schema would not fire.
+    assert_eq!(
+        decide("SELECT * FROM orders", SqlDialect::Postgres, DEV),
+        PolicyDecision::Deny(PolicyReason::UnresolvedIdentity)
+    );
+    assert_eq!(
+        decide("SELECT * FROM orders", SqlDialect::Postgres, PROD),
+        PolicyDecision::Deny(PolicyReason::UnresolvedIdentity)
+    );
+    // Qualified: identity is proven, policy proceeds to the matrix.
+    assert_eq!(decide("SELECT * FROM public.orders", SqlDialect::Postgres, DEV), PolicyDecision::Allow);
+    assert_eq!(decide("SELECT * FROM public.orders", SqlDialect::Postgres, PROD), PolicyDecision::Allow);
+}
+
+#[test]
+fn unresolved_identity_beats_other_reasons() {
+    // Even a side-effecting unqualified read is reported as identity
+    // failure first: the object is unknown, everything else is moot.
+    assert_eq!(
+        decide("SELECT * FROM orders FOR UPDATE", SqlDialect::Postgres, DEV),
+        PolicyDecision::Deny(PolicyReason::UnresolvedIdentity)
+    );
+}
+
+#[test]
+fn data_modifying_cte_never_reaches_policy() {
+    let res = StrictSqlAnalyzer.analyze(&AnalyzeRequest {
+        sql: "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+        dialect: SqlDialect::Postgres,
+        default_database: Some("appdb"),
+    });
+    assert!(res.is_err());
+}
+
+#[test]
+fn qualified_function_calls_pass_policy() {
+    assert_eq!(decide("SELECT pg_catalog.now()", SqlDialect::Postgres, DEV), PolicyDecision::Allow);
+    assert_eq!(
+        decide("SELECT myschema.now()", SqlDialect::Postgres, DEV),
+        PolicyDecision::Deny(PolicyReason::SideEffectSelect)
+    );
 }

@@ -19,7 +19,7 @@
 //!   catch-all for everything else.
 
 use sqlparser::ast::{
-    Expr, Function, ObjectName, Query, Select, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
+    Expr, Function, Ident, ObjectName, Query, Select, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
 };
 use sqlparser::dialect::{
     Dialect as ParserDialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
@@ -96,6 +96,18 @@ pub struct TableRef {
     pub database: NameState,
     pub schema: NameState,
     pub table: String,
+}
+
+impl TableRef {
+    /// True if any level could not be reliably determined (e.g. a
+    /// PostgreSQL schema left to `search_path`). Such a reference must
+    /// never reach authorization: at the RBAC layer a wildcard rule
+    /// *would* match it while a table-level DENY on the real schema
+    /// would not fire. The policy denies these outright; the future
+    /// gateway must refuse to build checks from them.
+    pub fn has_unknown_level(&self) -> bool {
+        matches!(self.database, NameState::Unknown) || matches!(self.schema, NameState::Unknown)
+    }
 }
 
 /// One analyzed statement.
@@ -207,48 +219,73 @@ impl<'a> QueryWalker<'a> {
 
     /// Extract the identifier string from one `ObjectName` part.
     /// Function parts (dialect-specific computed names) are unsupported.
-    fn part_ident(part: &sqlparser::ast::ObjectNamePart) -> Result<&str, AnalyzeError> {
+    fn part_ident(part: &sqlparser::ast::ObjectNamePart) -> Result<&Ident, AnalyzeError> {
         use sqlparser::ast::ObjectNamePart;
         match part {
-            ObjectNamePart::Identifier(i) => Ok(i.value.as_str()),
-            ObjectNamePart::Function(_) => {
-                Err(AnalyzeError::Unsupported { reason: "computed table name part".to_string() })
-            }
+            ObjectNamePart::Identifier(i) => Ok(i),
+            ObjectNamePart::Function(_) => Err(AnalyzeError::Unsupported { reason: "computed name part".to_string() }),
         }
     }
 
-    /// Map an `ObjectName` to a three-level `TableRef`.
+    /// Canonicalize one identifier for identity resolution.
     ///
-    /// - 1 part: unqualified; database falls back to the connection
-    ///   default (or `NotApplicable`), schema is `NotApplicable`
-    ///   ("not specified in SQL": only wildcard-schema grants match —
-    ///   a grant pinned to `schema = "public"` must not authorize
-    ///   `SELECT * FROM orders`, whose effective schema is unknown).
-    /// - 2 parts: `[db, table]` on MySQL, `[schema, table]` elsewhere.
-    /// - 3 parts: `[db, schema, table]` (SQL Server; preserved, never
-    ///   dropped).
-    /// - 4+ parts (linked servers, ...): unsupported.
+    /// PostgreSQL folds unquoted identifiers to lower case (quoted are
+    /// literal) — this is the canonicalization the TASK-004 RBAC
+    /// contract assigns to the analyzer. Other V1 dialects keep the
+    /// identifier as-is (MySQL/SQL Server case behavior is
+    /// filesystem/collation-dependent; exact matching there fails
+    /// closed, never open).
+    fn canonical(&self, ident: &Ident) -> String {
+        match self.ctx.dialect {
+            SqlDialect::Postgres if ident.quote_style.is_none() => ident.value.to_lowercase(),
+            _ => ident.value.clone(),
+        }
+    }
+
+    /// The connection's database, or `Unknown` when the analyzer was
+    /// not given one. Never guessed.
+    fn db_or_unknown(&self) -> NameState {
+        self.ctx.default_database.as_deref().map(NameState::present).unwrap_or(NameState::Unknown)
+    }
+
+    /// Resolve a table name to a [`TableRef`] with fail-closed identity.
+    ///
+    /// V1 identity rules: MySQL has no schema level (`NotApplicable` is
+    /// legitimate there; the database is the connection default, else
+    /// `Unknown`). SQLite resolves unqualified names to `main`
+    /// (`temp`/attached databases require 2-part qualification). On
+    /// PostgreSQL, SQL Server and Generic an unqualified schema is
+    /// `Unknown`, because `search_path` (PG) and per-user default
+    /// schemas (SQL Server) cannot be determined statically.
+    ///
+    /// It is **not** `NotApplicable`: treating it as such would let a
+    /// wildcard ALLOW match while a table-level DENY on the real schema
+    /// does not fire. V1 requires explicit qualification; the policy
+    /// denies `Unknown` levels outright.
     fn table_ref(&self, name: &ObjectName) -> Result<TableRef, AnalyzeError> {
-        let parts: Vec<&str> = name.0.iter().map(Self::part_ident).collect::<Result<_, _>>()?;
-        let db_default = self.ctx.default_database.as_deref();
-        match parts.as_slice() {
-            [table] => Ok(TableRef {
-                database: db_default.map(NameState::present).unwrap_or(NameState::NotApplicable),
-                schema: NameState::NotApplicable,
-                table: table.to_string(),
-            }),
+        let parts: Vec<&Ident> = name.0.iter().map(Self::part_ident).collect::<Result<_, _>>()?;
+        let names: Vec<String> = parts.iter().map(|i| self.canonical(i)).collect();
+        match names.as_slice() {
+            [table] => {
+                let (database, schema) = match self.ctx.dialect {
+                    SqlDialect::MySql => (self.db_or_unknown(), NameState::NotApplicable),
+                    SqlDialect::Sqlite => (NameState::present("main"), NameState::NotApplicable),
+                    _ => (self.db_or_unknown(), NameState::Unknown),
+                };
+                Ok(TableRef { database, schema, table: table.clone() })
+            }
             [a, b] => {
                 let (database, schema) = match self.ctx.dialect {
-                    SqlDialect::MySql => (NameState::present(*a), NameState::NotApplicable),
-                    _ => {
-                        (db_default.map(NameState::present).unwrap_or(NameState::NotApplicable), NameState::present(*a))
-                    }
+                    SqlDialect::MySql | SqlDialect::Sqlite => (NameState::present(a.clone()), NameState::NotApplicable),
+                    _ => (self.db_or_unknown(), NameState::present(a.clone())),
                 };
-                Ok(TableRef { database, schema, table: b.to_string() })
+                Ok(TableRef { database, schema, table: b.clone() })
             }
-            [a, b, c] => {
-                Ok(TableRef { database: NameState::present(*a), schema: NameState::present(*b), table: c.to_string() })
-            }
+            [a, b, c] => Ok(TableRef {
+                database: NameState::present(a.clone()),
+                schema: NameState::present(b.clone()),
+                table: c.clone(),
+            }),
             _ => Err(AnalyzeError::Unsupported { reason: format!("table name with {} parts", parts.len()) }),
         }
     }
@@ -257,7 +294,7 @@ impl<'a> QueryWalker<'a> {
         name.0
             .last()
             .and_then(|p| Self::part_ident(p).ok())
-            .map(|n| self.cte_names.iter().any(|cte| cte == &n.to_uppercase()))
+            .map(|n| self.cte_names.iter().any(|cte| cte == &n.value.to_uppercase()))
             .unwrap_or(false)
     }
 
@@ -272,12 +309,39 @@ impl<'a> QueryWalker<'a> {
         Ok(())
     }
 
+    /// A function call is proven side-effect-free iff the name is on the
+    /// pure allowlist **and** its identity is proven:
+    /// - unqualified (`now()`), or
+    /// - qualified by a known system schema (`pg_catalog.now()`).
+    ///
+    /// A user-schema qualification (`myschema.now()`) is *not* proven:
+    /// it may resolve to a UDF shadowing a builtin name, so it is
+    /// treated as having side effects (policy denies). Unqualified
+    /// names still depend on `search_path`; planting a shadowing UDF
+    /// requires DDL, which the gateway denies, so the residual risk is
+    /// documented rather than blocking all unqualified calls in V1.
+    fn is_proven_pure(&self, name: &ObjectName) -> Result<bool, AnalyzeError> {
+        let parts: Vec<String> =
+            name.0.iter().map(|p| Self::part_ident(p).map(|i| self.canonical(i))).collect::<Result<_, _>>()?;
+        let (qualifiers, func) = match parts.as_slice() {
+            [] => return Ok(false),
+            [func] => (&[][..], func),
+            [q @ .., func] => (q, func),
+        };
+        if !is_pure_function(&func.to_uppercase()) {
+            return Ok(false);
+        }
+        if qualifiers.is_empty() {
+            return Ok(true);
+        }
+        // Every qualifier must be a known system schema; anything else
+        // could be a user schema with a shadowing UDF.
+        Ok(qualifiers.iter().all(|q| matches!(q.to_lowercase().as_str(), "pg_catalog" | "sys")))
+    }
+
     fn check_function(&mut self, func: &Function) -> Result<(), AnalyzeError> {
         use sqlparser::ast::{FunctionArgExpr, FunctionArguments};
-        // Strip qualification: `pg_catalog.now()` -> `NOW`.
-        let name =
-            func.name.0.last().and_then(|p| Self::part_ident(p).ok()).map(|n| n.to_uppercase()).unwrap_or_default();
-        if !is_pure_function(&name) {
+        if !self.is_proven_pure(&func.name)? {
             self.side_effects = true;
         }
         match &func.args {
@@ -407,9 +471,14 @@ impl<'a> QueryWalker<'a> {
                     self.push_source(&ObjectName(parts))?;
                 }
             }
-            // INSERT/UPDATE/DELETE cannot appear as set operands in the
-            // dialects we parse; anything else here is out of scope.
-            _ => {}
+            // Data-modifying statements in CTE/subquery position, e.g.
+            // PostgreSQL `WITH d AS (DELETE FROM t RETURNING *)`. These
+            // are writes disguised as query structure: outside the V1
+            // positive list, so fail closed instead of misreporting a
+            // pure Select with an empty resource list.
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => {
+                return Err(AnalyzeError::Unsupported { reason: "data-modifying CTE/subquery".to_string() });
+            }
         }
         Ok(())
     }
@@ -530,10 +599,8 @@ impl<'a> QueryWalker<'a> {
             }
             TableFactor::Derived { subquery, .. } => self.walk_query(subquery)?,
             TableFactor::Function { name, args, .. } => {
-                // Table function: same purity discipline as scalar calls.
-                let fname =
-                    name.0.last().and_then(|p| Self::part_ident(p).ok()).map(|n| n.to_uppercase()).unwrap_or_default();
-                if !is_pure_function(&fname) {
+                // Table function: same proven-purity discipline as scalar calls.
+                if !self.is_proven_pure(name)? {
                     self.side_effects = true;
                 }
                 for arg in args {

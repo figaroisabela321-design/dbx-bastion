@@ -38,6 +38,10 @@ fn na() -> String {
     format!("{:?}", NameState::NotApplicable)
 }
 
+fn u() -> String {
+    format!("{:?}", NameState::Unknown)
+}
+
 // ---- 1. SELECT / JOIN / CTE / subquery -----------------------------------
 
 #[test]
@@ -70,7 +74,7 @@ fn cte_names_are_not_physical_tables() {
     // `recent` must not appear; `orders` (inside the CTE) must.
     assert_eq!(
         tables(&s.sources),
-        vec![(p("appdb"), na(), "customers".to_string()), (p("appdb"), na(), "orders".to_string())]
+        vec![(p("appdb"), u(), "customers".to_string()), (p("appdb"), u(), "orders".to_string())]
     );
 }
 
@@ -84,9 +88,9 @@ fn nested_subqueries_and_exists() {
     assert_eq!(
         tables(&s.sources),
         vec![
-            (p("appdb"), na(), "orders".to_string()),
-            (p("appdb"), na(), "payments".to_string()),
-            (p("appdb"), na(), "refunds".to_string()),
+            (p("appdb"), u(), "orders".to_string()),
+            (p("appdb"), u(), "payments".to_string()),
+            (p("appdb"), u(), "refunds".to_string()),
         ]
     );
 }
@@ -136,10 +140,10 @@ fn insert_on_conflict_walks_subqueries() {
         SqlDialect::Postgres,
     );
     assert_eq!(s.action, StatementAction::Insert);
-    assert_eq!(tables(&s.targets), vec![(p("appdb"), na(), "orders".to_string())]);
+    assert_eq!(tables(&s.targets), vec![(p("appdb"), u(), "orders".to_string())]);
     assert_eq!(
         tables(&s.sources),
-        vec![(p("appdb"), na(), "cfg".to_string()), (p("appdb"), na(), "staging".to_string())]
+        vec![(p("appdb"), u(), "cfg".to_string()), (p("appdb"), u(), "staging".to_string())]
     );
 }
 
@@ -165,9 +169,9 @@ fn update_with_where() {
 fn update_from_collects_source_tables() {
     let s = one("UPDATE orders o SET o.status = 'x' FROM audit_log a WHERE o.id = a.oid", SqlDialect::Postgres);
     assert_eq!(s.action, StatementAction::Update);
-    assert_eq!(tables(&s.targets), vec![(p("appdb"), na(), "orders".to_string())]);
+    assert_eq!(tables(&s.targets), vec![(p("appdb"), u(), "orders".to_string())]);
     // `orders` is the target; only `audit_log` remains as a source.
-    assert_eq!(tables(&s.sources), vec![(p("appdb"), na(), "audit_log".to_string())]);
+    assert_eq!(tables(&s.sources), vec![(p("appdb"), u(), "audit_log".to_string())]);
     assert_eq!(s.has_where, Some(true));
 }
 
@@ -177,8 +181,8 @@ fn update_from_collects_source_tables() {
 fn delete_using() {
     let s = one("DELETE FROM orders USING audit_log WHERE orders.id = audit_log.oid", SqlDialect::Postgres);
     assert_eq!(s.action, StatementAction::Delete);
-    assert_eq!(tables(&s.targets), vec![(p("appdb"), na(), "orders".to_string())]);
-    assert_eq!(tables(&s.sources), vec![(p("appdb"), na(), "audit_log".to_string())]);
+    assert_eq!(tables(&s.targets), vec![(p("appdb"), u(), "orders".to_string())]);
+    assert_eq!(tables(&s.sources), vec![(p("appdb"), u(), "audit_log".to_string())]);
     assert_eq!(s.has_where, Some(true));
 }
 
@@ -288,9 +292,9 @@ fn connect_by_is_walked_completely() {
     // walked, so subqueries there cannot hide tables.
     let s = one("SELECT * FROM t CONNECT BY PRIOR id = pid START WITH id = 1", SqlDialect::Generic);
     assert_eq!(s.action, StatementAction::Select);
-    assert_eq!(tables(&s.sources), vec![(p("appdb"), na(), "t".to_string())]);
+    assert_eq!(tables(&s.sources), vec![(p("appdb"), u(), "t".to_string())]);
     let s = one("SELECT * FROM t WHERE id IN (SELECT pid FROM u) CONNECT BY PRIOR id = pid", SqlDialect::Generic);
-    assert_eq!(tables(&s.sources), vec![(p("appdb"), na(), "t".to_string()), (p("appdb"), na(), "u".to_string())]);
+    assert_eq!(tables(&s.sources), vec![(p("appdb"), u(), "t".to_string()), (p("appdb"), u(), "u".to_string())]);
 }
 
 // ---- 12. SQL Server three-part names preserved ----------------------------------
@@ -327,14 +331,20 @@ fn quoted_identifiers_keep_case() {
     let s = one("SELECT * FROM `Orders`", SqlDialect::MySql);
     assert_eq!(tables(&s.sources), vec![(p("appdb"), na(), "Orders".to_string())]);
     let s = one(r#"SELECT * FROM "Orders""#, SqlDialect::Postgres);
-    assert_eq!(tables(&s.sources), vec![(p("appdb"), na(), "Orders".to_string())]);
+    // Quoted identifiers keep case; the unqualified schema is Unknown.
+    assert_eq!(tables(&s.sources), vec![(p("appdb"), u(), "Orders".to_string())]);
 }
 
 #[test]
 fn sqlite_has_no_schema_level() {
     let s = one("SELECT * FROM main.orders", SqlDialect::Sqlite);
-    // sqlite: two parts are treated as schema.table like PG.
-    assert_eq!(tables(&s.sources), vec![(p("appdb"), p("main"), "orders".to_string())]);
+    // SQLite: two parts are database.table (attached-database name).
+    assert_eq!(tables(&s.sources), vec![(p("main"), na(), "orders".to_string())]);
+    // Bare tables resolve to `main`, never a guess.
+    let s = one("SELECT * FROM orders", SqlDialect::Sqlite);
+    assert_eq!(tables(&s.sources), vec![(p("main"), na(), "orders".to_string())]);
+    let s = one("SELECT * FROM temp.orders", SqlDialect::Sqlite);
+    assert_eq!(tables(&s.sources), vec![(p("temp"), na(), "orders".to_string())]);
 }
 
 // ---- 14. side-effect SELECTs -------------------------------------------------------
@@ -343,8 +353,8 @@ fn sqlite_has_no_schema_level() {
 fn select_into_is_side_effect() {
     let s = one("SELECT * INTO new_orders FROM orders", SqlDialect::SqlServer);
     assert!(s.has_side_effects);
-    assert_eq!(tables(&s.targets), vec![(p("appdb"), na(), "new_orders".to_string())]);
-    assert_eq!(tables(&s.sources), vec![(p("appdb"), na(), "orders".to_string())]);
+    assert_eq!(tables(&s.targets), vec![(p("appdb"), u(), "new_orders".to_string())]);
+    assert_eq!(tables(&s.sources), vec![(p("appdb"), u(), "orders".to_string())]);
 }
 
 #[test]
@@ -384,6 +394,7 @@ fn derived_tables_and_aliases() {
          JOIN (SELECT id FROM customers) c ON t.cid = c.id",
         SqlDialect::MySql,
     );
+    // MySQL has no schema level: NotApplicable is legitimate here.
     assert_eq!(
         tables(&s.sources),
         vec![(p("appdb"), na(), "customers".to_string()), (p("appdb"), na(), "orders".to_string())]
@@ -450,9 +461,70 @@ fn unknown_statement_is_never_select() {
 // ---- default database handling ---------------------------------------------------------------
 
 #[test]
-fn no_default_db_leaves_database_not_applicable() {
+fn no_default_db_leaves_database_unknown() {
+    // Standalone mode with no connection default: the database is
+    // Unknown, never guessed; MySQL still has no schema level.
     let s = analyze_no_default_db("SELECT * FROM orders", SqlDialect::MySql).unwrap().into_iter().next().unwrap();
-    assert_eq!(tables(&s.sources), vec![(na(), na(), "orders".to_string())]);
+    assert_eq!(tables(&s.sources), vec![(u(), na(), "orders".to_string())]);
+}
+
+// ---- security fix: identity resolution --------------------------------------
+// Unqualified names on dialects with a real schema level (PG/SQL Server)
+// resolve to Unknown, never NotApplicable. Rationale: at the RBAC
+// layer a wildcard rule WOULD match an Unknown level while a
+// table-level DENY on the real schema would not fire — so the policy
+// must deny before RBAC. This test locks the analyzer half of that.
+
+#[test]
+fn unqualified_schema_is_unknown_not_not_applicable() {
+    for dialect in [SqlDialect::Postgres, SqlDialect::SqlServer, SqlDialect::Generic] {
+        let s = one("SELECT * FROM orders", dialect);
+        assert_eq!(s.sources[0].schema, NameState::Unknown, "{dialect:?}");
+        assert!(s.sources[0].has_unknown_level());
+    }
+    // MySQL genuinely has no schema level: NotApplicable stays legitimate.
+    let s = one("SELECT * FROM orders", SqlDialect::MySql);
+    assert_eq!(s.sources[0].schema, NameState::NotApplicable);
+    assert!(!s.sources[0].has_unknown_level());
+}
+
+#[test]
+fn postgres_folds_unquoted_identifiers() {
+    // Unquoted -> lower case (the real PG object); quoted stays literal.
+    let s = one("SELECT * FROM ORDERS", SqlDialect::Postgres);
+    assert_eq!(s.sources[0].table, "orders");
+    let s = one(r#"SELECT * FROM "ORDERS""#, SqlDialect::Postgres);
+    assert_eq!(s.sources[0].table, "ORDERS");
+}
+
+// ---- security fix: function identity -----------------------------------------
+
+#[test]
+fn qualified_functions_need_proven_builtin_identity() {
+    // pg_catalog.now() is provably the builtin: fine.
+    let s = one("SELECT pg_catalog.now()", SqlDialect::Postgres);
+    assert!(!s.has_side_effects);
+    // A user-schema qualification may shadow a builtin with a UDF: deny.
+    let s = one("SELECT myschema.now()", SqlDialect::Postgres);
+    assert!(s.has_side_effects);
+    let s = one("SELECT public.my_udf(id) FROM public.orders", SqlDialect::Postgres);
+    assert!(s.has_side_effects);
+}
+
+// ---- security fix: data-modifying CTEs ---------------------------------------
+
+#[test]
+fn data_modifying_ctes_are_rejected() {
+    // Writes disguised as query structure: never misreported as a pure
+    // Select with an empty resource list.
+    for sql in [
+        "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+        "WITH i AS (INSERT INTO t SELECT * FROM s RETURNING *) SELECT * FROM i",
+        "WITH u AS (UPDATE t SET x = 1 RETURNING *) SELECT * FROM u",
+    ] {
+        let res = analyze(sql, SqlDialect::Postgres);
+        assert!(res.is_err(), "{sql} must be rejected, got {res:?}");
+    }
 }
 
 // ---- perf smoke: analysis latency baseline ------------------------------------------------------

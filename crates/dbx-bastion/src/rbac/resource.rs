@@ -123,6 +123,20 @@ mod tests {
         assert!(!level_matches(Some("public"), &NameState::Unknown));
     }
 
+    /// Documents the hazard behind the analyzer's `Unknown` handling:
+    /// a wildcard ALLOW *would* match an Unknown level, while a
+    /// table-level DENY on the real schema would not fire. That is why
+    /// the SQL policy denies `Unknown` levels before any RBAC matching
+    /// (and why the gateway must refuse to build checks from them) —
+    /// otherwise omitting the schema would bypass the DENY.
+    #[test]
+    fn wildcard_matches_unknown_so_policy_must_deny_first() {
+        // The hazard: DENY(public.orders) does not fire on Unknown…
+        assert!(!level_matches(Some("public"), &NameState::Unknown));
+        // …but a wildcard ALLOW would match the same request.
+        assert!(level_matches(None, &NameState::Unknown));
+    }
+
     #[test]
     fn star_is_literal_unless_normalized() {
         // Without normalization "prod_*" is just a literal string.
