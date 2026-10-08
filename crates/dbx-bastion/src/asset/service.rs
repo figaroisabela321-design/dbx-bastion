@@ -54,16 +54,6 @@ impl AssetAdminGuard {
         }
         Ok(user.id)
     }
-
-    /// Verify the caller is an enabled authenticated user (no admin role
-    /// required). Used for the credential-free view endpoints.
-    pub async fn check_authenticated(&self, principal: &Principal) -> Result<Uuid> {
-        let user = self.store.find_user_by_id(principal.user_id).await?.ok_or(BastionError::AuthenticationFailed)?;
-        if !user.enabled {
-            return Err(BastionError::AuthenticationFailed);
-        }
-        Ok(user.id)
-    }
 }
 
 pub struct AssetService {
@@ -289,12 +279,15 @@ impl AssetService {
         self.store.list_assets(&filter, &page).await
     }
 
-    /// Credential-free view for one asset. Authenticated users only.
-    /// NOTE (TASK-003): visibility is not yet authorization-scoped; P3 RBAC
-    /// will filter to granted asset IDs. The DTO guarantee (no
-    /// `dbx_connection_id`, no credentials) holds from day one.
+    /// Credential-free view for one asset.
+    ///
+    /// SECURITY (TASK-003 hardening): until the TASK-004 RBAC engine
+    /// exists, ordinary users are default-deny — this is restricted to
+    /// platform administrators re-verified against the database on every
+    /// call. The DTO guarantee (no `dbx_connection_id`, no credentials)
+    /// holds regardless.
     pub async fn get_asset_view(&self, principal: &Principal, asset_id: Uuid) -> Result<AssetView> {
-        self.guard.check_authenticated(principal).await?;
+        self.guard.check(principal).await?;
         let asset = self
             .store
             .resolve_asset(asset_id)
@@ -303,15 +296,16 @@ impl AssetService {
         Ok(AssetView::from(&asset))
     }
 
-    /// Credential-free paginated listing. Same TASK-003 visibility note as
-    /// [`Self::get_asset_view`].
+    /// Credential-free paginated listing. Same TASK-003 restriction as
+    /// [`Self::get_asset_view`]: administrators only until TASK-004 RBAC
+    /// replaces this with grant-scoped filtering.
     pub async fn list_asset_views(
         &self,
         principal: &Principal,
         filter: AssetFilter,
         page: PageRequest,
     ) -> Result<Page<AssetView>> {
-        self.guard.check_authenticated(principal).await?;
+        self.guard.check(principal).await?;
         let page_result = self.store.list_assets(&filter, &page).await?;
         let items = page_result.items.iter().map(AssetView::from).collect();
         Ok(Page { items, total: page_result.total, page: page_result.page, page_size: page_result.page_size })
@@ -381,6 +375,10 @@ impl AssetService {
 
     /// Move a group under a new parent (`None` = root). Rejects hierarchy
     /// cycles, including self-parenting.
+    /// Move a group under a new parent (`None` = root). Cycle detection
+    /// and the write are atomic inside the repository
+    /// ([`AssetGroupRepository::set_group_parent_checked`]): concurrent
+    /// moves cannot interleave into a cycle.
     pub async fn move_group(
         &self,
         principal: &Principal,
@@ -388,30 +386,7 @@ impl AssetService {
         new_parent_id: Option<Uuid>,
     ) -> Result<AssetGroup> {
         self.guard.check(principal).await?;
-        self.get_group(group_id).await?;
-        if let Some(parent_id) = new_parent_id {
-            if self.store.find_group(parent_id).await?.is_none() {
-                return Err(BastionError::InvalidData(format!("parent group not found: {parent_id}")));
-            }
-            self.ensure_no_cycle(group_id, parent_id).await?;
-        }
-        self.store.set_group_parent(group_id, new_parent_id).await
-    }
-
-    async fn ensure_no_cycle(&self, group_id: Uuid, new_parent_id: Uuid) -> Result<()> {
-        let mut current = Some(new_parent_id);
-        while let Some(ancestor) = current {
-            if ancestor == group_id {
-                return Err(BastionError::InvalidData("group hierarchy would contain a cycle".into()));
-            }
-            let group = self
-                .store
-                .find_group(ancestor)
-                .await?
-                .ok_or_else(|| BastionError::InvalidData(format!("group not found: {ancestor}")))?;
-            current = group.parent_id;
-        }
-        Ok(())
+        self.store.set_group_parent_checked(group_id, new_parent_id).await
     }
 
     /// Delete a group. Refuses non-empty groups (members or child groups):

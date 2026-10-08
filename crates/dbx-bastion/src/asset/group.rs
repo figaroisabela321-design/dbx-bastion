@@ -42,7 +42,12 @@ pub trait AssetGroupRepository: Send + Sync {
     async fn find_group(&self, group_id: Uuid) -> Result<Option<AssetGroup>>;
     async fn find_group_by_name(&self, name: &str) -> Result<Option<AssetGroup>>;
     async fn update_group(&self, group_id: Uuid, patch: &UpdateAssetGroup) -> Result<AssetGroup>;
-    async fn set_group_parent(&self, group_id: Uuid, parent_id: Option<Uuid>) -> Result<AssetGroup>;
+    /// Atomically set a group's parent (`None` = root), rejecting
+    /// hierarchy cycles. The ancestor walk and the write run in a single
+    /// `BEGIN IMMEDIATE` transaction: concurrent moves serialize, so the
+    /// check observes their committed writes and no interleaving can form
+    /// a cycle. A check-then-act split across calls is NOT safe.
+    async fn set_group_parent_checked(&self, group_id: Uuid, parent_id: Option<Uuid>) -> Result<AssetGroup>;
     /// Delete an empty group. Implementations must refuse non-empty groups;
     /// the service enforces the policy, the repository executes it.
     async fn delete_group(&self, group_id: Uuid) -> Result<()>;

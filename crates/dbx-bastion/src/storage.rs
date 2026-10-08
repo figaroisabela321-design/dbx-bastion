@@ -617,20 +617,49 @@ impl AssetGroupRepository for SqliteStore {
         .await
     }
 
-    async fn set_group_parent(&self, group_id: Uuid, parent_id: Option<Uuid>) -> Result<AssetGroup> {
-        self.blocking(move |conn| {
-            let updated = conn.execute(
+    async fn set_group_parent_checked(&self, group_id: Uuid, parent_id: Option<Uuid>) -> Result<AssetGroup> {
+        self.in_transaction(move |tx| {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM asset_groups WHERE id = ?1)",
+                [group_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(BastionError::InvalidData(format!("asset group not found: {group_id}")));
+            }
+            if let Some(pid) = parent_id {
+                let parent_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM asset_groups WHERE id = ?1)",
+                    [pid.to_string()],
+                    |row| row.get(0),
+                )?;
+                if !parent_exists {
+                    return Err(BastionError::InvalidData(format!("parent group not found: {pid}")));
+                }
+                // Ancestor walk inside the same transaction. Concurrent
+                // moves serialize on the IMMEDIATE transaction (5s busy
+                // timeout), so this walk observes their committed writes;
+                // no check-then-act interleaving can form a cycle.
+                let mut current = Some(pid);
+                while let Some(ancestor) = current {
+                    if ancestor == group_id {
+                        return Err(BastionError::InvalidData("group hierarchy would contain a cycle".into()));
+                    }
+                    let parent: Option<String> = tx
+                        .query_row("SELECT parent_id FROM asset_groups WHERE id = ?1", [ancestor.to_string()], |row| {
+                            row.get(0)
+                        })
+                        .optional()?
+                        .flatten();
+                    current = parent.map(parse_uuid).transpose()?;
+                }
+            }
+            tx.execute(
                 "UPDATE asset_groups SET parent_id = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![parent_id.map(|v| v.to_string()), to_text(chrono::Utc::now()), group_id.to_string(),],
             )?;
-            if updated == 0 {
-                return Err(BastionError::InvalidData(format!("asset group not found: {group_id}")));
-            }
-            let row: GroupRow = conn.query_row(
-                &format!("SELECT {GROUP_COLUMNS} FROM asset_groups WHERE id = ?1"),
-                [group_id.to_string()],
-                map_group_row,
-            )?;
+            let sql = format!("SELECT {GROUP_COLUMNS} FROM asset_groups WHERE id = ?1");
+            let row: GroupRow = tx.query_row(&sql, [group_id.to_string()], map_group_row)?;
             to_group(row)
         })
         .await

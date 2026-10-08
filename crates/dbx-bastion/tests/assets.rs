@@ -237,9 +237,50 @@ async fn non_admin_cannot_manage_assets() {
     );
     assert_forbidden(assets.get_asset(&user, asset.id).await.map(|_| ()));
     assert_forbidden(assets.list_assets(&user, AssetFilter::default(), Default::default()).await.map(|_| ()));
-    // But the credential-free view works for authenticated users.
-    let view = assets.get_asset_view(&user, asset.id).await.unwrap();
+    // Default deny: even the credential-free views are admin-only until
+    // the TASK-004 RBAC engine provides grant-scoped visibility.
+    assert_forbidden(assets.get_asset_view(&user, asset.id).await.map(|_| ()));
+    assert_forbidden(assets.list_asset_views(&user, AssetFilter::default(), Default::default()).await.map(|_| ()));
+    // The admin can still use the views (DTO hides the connection id).
+    let view = assets.get_asset_view(&admin, asset.id).await.unwrap();
     assert_eq!(view.name, "guarded-db");
+}
+
+// ---- 3b. default-deny on views: user/admin/disabled/role-revoked ---------
+
+#[tokio::test]
+async fn view_default_deny_user_admin_disabled_revoked() {
+    let ctx = Ctx::new("view-deny").await;
+    let admin = ctx.make_admin("assetadmin").await;
+    let user = ctx.make_user("mallory").await;
+    let assets = ctx.assets();
+    let asset = ctx.create_asset(&admin, "denied-db").await;
+
+    // Ordinary authenticated user: denied on both views.
+    assert_forbidden(assets.get_asset_view(&user, asset.id).await.map(|_| ()));
+    assert_forbidden(assets.list_asset_views(&user, AssetFilter::default(), Default::default()).await.map(|_| ()));
+
+    // Platform admin (re-verified against the DB): allowed.
+    let view = assets.get_asset_view(&admin, asset.id).await.unwrap();
+    assert_eq!(view.id, asset.id);
+    let page = assets.list_asset_views(&admin, AssetFilter::default(), Default::default()).await.unwrap();
+    assert_eq!(page.total, 1);
+
+    // Disabled admin: rejected even with a previously valid principal.
+    ctx.service.store().set_user_enabled(admin.user_id, false).await.unwrap();
+    let err = assets.get_asset_view(&admin, asset.id).await.unwrap_err();
+    assert!(matches!(err, BastionError::AuthenticationFailed), "disabled admin must be rejected, got {err:?}");
+    ctx.service.store().set_user_enabled(admin.user_id, true).await.unwrap();
+
+    // Role revoked out-of-band: the next call fails immediately, even
+    // though the Principal snapshot still lists bastion-admin.
+    assert!(admin.roles.contains(&"bastion-admin".to_string()));
+    {
+        let conn = rusqlite::Connection::open(&ctx.db_path).unwrap();
+        conn.execute("DELETE FROM user_roles WHERE user_id = ?1", [admin.user_id.to_string()]).unwrap();
+    }
+    assert_forbidden(assets.get_asset_view(&admin, asset.id).await.map(|_| ()));
+    assert_forbidden(assets.list_asset_views(&admin, AssetFilter::default(), Default::default()).await.map(|_| ()));
 }
 
 #[tokio::test]
@@ -276,7 +317,6 @@ async fn disabled_admin_cannot_manage_assets() {
 async fn asset_surfaces_carry_no_credentials() {
     let ctx = Ctx::new("no-creds").await;
     let admin = ctx.make_admin("assetadmin").await;
-    let user = ctx.make_user("mallory").await;
     let assets = ctx.assets();
     let asset = ctx.create_asset(&admin, "vault-db").await;
 
@@ -288,13 +328,14 @@ async fn asset_surfaces_carry_no_credentials() {
         assert!(!full_json.to_lowercase().contains(needle), "admin asset JSON must not contain {needle}");
     }
 
-    // Ordinary-user view: dbx_connection_id is absent by construction.
-    let view = assets.get_asset_view(&user, asset.id).await.unwrap();
+    // AssetView DTO: dbx_connection_id is absent by construction
+    // (verified through the admin-only view endpoints).
+    let view = assets.get_asset_view(&admin, asset.id).await.unwrap();
     let view_json = serde_json::to_string(&view).unwrap();
     assert!(!view_json.contains("dbx_connection_id"), "AssetView must not expose dbx_connection_id: {view_json}");
     assert!(!view_json.contains(&asset.dbx_connection_id), "AssetView must not leak the connection reference");
 
-    let page = assets.list_asset_views(&user, AssetFilter::default(), Default::default()).await.unwrap();
+    let page = assets.list_asset_views(&admin, AssetFilter::default(), Default::default()).await.unwrap();
     assert_eq!(page.items.len(), 1);
     let list_json = serde_json::to_string(&page.items).unwrap();
     assert!(!list_json.contains("dbx_connection_id"));
@@ -520,6 +561,53 @@ async fn group_cycle_rejected() {
     // Tree unchanged after rejected moves.
     let a_again = ctx.service.store().find_group(a.id).await.unwrap().unwrap();
     assert!(a_again.parent_id.is_none());
+}
+
+// ---- 13b. concurrent moves cannot interleave into a cycle ---------------------
+
+#[tokio::test]
+async fn concurrent_group_moves_cannot_form_cycle() {
+    let ctx = Ctx::new("move-race").await;
+    let admin = ctx.make_admin("assetadmin").await;
+    let assets =
+        Arc::new(AssetService::new(ctx.service.store().clone(), ctx.dbx.clone() as Arc<dyn DbxConnectionAdapter>));
+
+    let mk = |name: &str, parent_id: Option<Uuid>| NewAssetGroup {
+        name: name.to_string(),
+        parent_id,
+        description: String::new(),
+    };
+    let a = assets.create_group(&admin, mk("a", None)).await.unwrap();
+    let b = assets.create_group(&admin, mk("b", None)).await.unwrap();
+    let c = assets.create_group(&admin, mk("c", Some(b.id))).await.unwrap();
+
+    // T1: move A under C. T2: move B under A. Sequentially exactly one of
+    // these orders is legal; the second committer must observe the first's
+    // write inside its transaction and refuse the cycle. With a split
+    // check-then-act, the interleaving could produce A -> C -> B -> A.
+    let s1 = Arc::clone(&assets);
+    let s2 = Arc::clone(&assets);
+    let admin2 = admin.clone();
+    let t1 = tokio::spawn(async move { s1.move_group(&admin, a.id, Some(c.id)).await });
+    let t2 = tokio::spawn(async move { s2.move_group(&admin2, b.id, Some(a.id)).await });
+    let r1 = t1.await.unwrap();
+    let r2 = t2.await.unwrap();
+    assert!(r1.is_ok() ^ r2.is_ok(), "exactly one concurrent move must win, got {r1:?} / {r2:?}");
+    let loser = if r1.is_err() { r1.unwrap_err() } else { r2.unwrap_err() };
+    assert!(matches!(loser, BastionError::InvalidData(_)), "loser must be rejected with a cycle error, got {loser:?}");
+
+    // No cycle in the final hierarchy: every ancestor walk terminates
+    // without revisiting a group.
+    let store = ctx.service.store();
+    for gid in [a.id, b.id, c.id] {
+        let mut seen = std::collections::HashSet::new();
+        let mut current = Some(gid);
+        while let Some(id) = current {
+            assert!(seen.insert(id), "cycle detected in group hierarchy");
+            assert!(seen.len() <= 3, "ancestor walk did not terminate");
+            current = store.find_group(id).await.unwrap().unwrap().parent_id;
+        }
+    }
 }
 
 // ---- 14. non-empty group delete refused -------------------------------------------------
