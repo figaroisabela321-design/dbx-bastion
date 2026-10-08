@@ -53,4 +53,10 @@ pub enum BastionError {
     /// The caller should re-read current state and retry with fresh input.
     #[error("concurrent modification: {0}")]
     ConcurrentModification(String),
+
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("dbx connection adapter unavailable: {0}")]
+    AdapterUnavailable(String),
 }

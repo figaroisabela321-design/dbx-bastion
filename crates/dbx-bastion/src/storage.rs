@@ -21,8 +21,13 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
-use crate::asset::{Asset, AssetRepository, Environment, NewUser, UserCredentialRecord, UserRepository};
-use crate::auth::session::{to_text, SessionRecord, SessionRepository};
+use crate::asset::group::{AssetGroup, AssetGroupRepository, NewAssetGroup, UpdateAssetGroup};
+use crate::asset::mapping::ConnectionTestStatus;
+use crate::asset::{
+    Asset, AssetFilter, AssetPatch, AssetRepository, Environment, NewUser, Page, PageRequest, UserCredentialRecord,
+    UserRepository,
+};
+use crate::auth::session::{parse_text, to_text, SessionRecord, SessionRepository};
 use crate::auth::Principal;
 use crate::error::{BastionError, Result};
 use crate::rbac::{Action, AuthorizationRepository, Effect, PermissionRule};
@@ -31,7 +36,22 @@ use crate::rbac::{Action, AuthorizationRepository, Effect, PermissionRule};
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("../migrations/0001_init.sql")),
     ("0002_auth", include_str!("../migrations/0002_auth.sql")),
+    ("0003_assets", include_str!("../migrations/0003_assets.sql")),
 ];
+
+/// SQLITE_CONSTRAINT_UNIQUE extended error code.
+const SQLITE_CONSTRAINT_UNIQUE: i32 = 2067;
+
+/// Map a unique-constraint violation to a friendly error; pass anything
+/// else through unchanged.
+fn map_unique_violation(err: BastionError, what: &str) -> BastionError {
+    if let BastionError::Storage(rusqlite::Error::SqliteFailure(sqlite_err, _)) = &err {
+        if sqlite_err.extended_code == SQLITE_CONSTRAINT_UNIQUE {
+            return BastionError::InvalidData(format!("{what} already exists"));
+        }
+    }
+    err
+}
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
@@ -171,33 +191,128 @@ fn parse_uuid(value: String) -> Result<Uuid> {
     Uuid::parse_str(&value).map_err(|error| BastionError::InvalidData(error.to_string()))
 }
 
+const ASSET_COLUMNS: &str = "id, name, environment, db_type, dbx_connection_id, enabled, description, deleted_at, last_tested_at, last_test_status, created_at, updated_at";
+
+/// Raw asset row in ASSET_COLUMNS order.
+type AssetRow = (
+    String,         // id
+    String,         // name
+    String,         // environment
+    String,         // db_type
+    String,         // dbx_connection_id
+    i64,            // enabled
+    String,         // description
+    Option<String>, // deleted_at
+    Option<String>, // last_tested_at
+    Option<String>, // last_test_status
+    String,         // created_at
+    String,         // updated_at
+);
+
+fn to_asset(row: AssetRow) -> Result<Asset> {
+    let (
+        id,
+        name,
+        environment,
+        db_type,
+        dbx_connection_id,
+        enabled,
+        description,
+        deleted_at,
+        last_tested_at,
+        last_test_status,
+        created_at,
+        updated_at,
+    ) = row;
+    Ok(Asset {
+        id: parse_uuid(id)?,
+        name,
+        environment: Environment::parse(&environment)
+            .ok_or_else(|| BastionError::InvalidData(format!("unknown environment: {environment}")))?,
+        db_type,
+        dbx_connection_id,
+        enabled: enabled != 0,
+        description,
+        deleted_at: deleted_at.map(|v| parse_text(&v)).transpose()?,
+        last_tested_at: last_tested_at.map(|v| parse_text(&v)).transpose()?,
+        last_test_status: last_test_status
+            .map(|v| {
+                ConnectionTestStatus::parse(&v)
+                    .ok_or_else(|| BastionError::InvalidData(format!("unknown test status: {v}")))
+            })
+            .transpose()?,
+        created_at: parse_text(&created_at)?,
+        updated_at: parse_text(&updated_at)?,
+    })
+}
+
+fn map_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+    ))
+}
+
+/// Escape LIKE wildcards in user input (`\`, `%`, `_`).
+fn escape_like(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 #[async_trait]
 impl AssetRepository for SqliteStore {
     async fn resolve_asset(&self, asset_id: Uuid) -> Result<Option<Asset>> {
         self.blocking(move |conn| {
-            let row: Option<(String, String, String, String, String, i64)> = conn
+            let row: Option<AssetRow> = conn
                 .query_row(
-                    "SELECT id, name, environment, db_type, dbx_connection_id, enabled
-                       FROM assets
-                      WHERE id = ?1 AND enabled = 1
-                      LIMIT 1",
+                    &format!(
+                        "SELECT {ASSET_COLUMNS} FROM assets
+                          WHERE id = ?1 AND enabled = 1 AND deleted_at IS NULL
+                          LIMIT 1"
+                    ),
                     [asset_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                    map_asset_row,
                 )
                 .optional()?;
+            row.map(to_asset).transpose()
+        })
+        .await
+    }
 
-            row.map(|(id, name, environment, db_type, dbx_connection_id, enabled)| {
-                Ok(Asset {
-                    id: parse_uuid(id)?,
-                    name,
-                    environment: Environment::parse(&environment)
-                        .ok_or_else(|| BastionError::InvalidData(format!("unknown environment: {environment}")))?,
-                    db_type,
-                    dbx_connection_id,
-                    enabled: enabled != 0,
-                })
-            })
-            .transpose()
+    async fn find_asset_by_id(&self, asset_id: Uuid) -> Result<Option<Asset>> {
+        self.blocking(move |conn| {
+            let row: Option<AssetRow> = conn
+                .query_row(
+                    &format!("SELECT {ASSET_COLUMNS} FROM assets WHERE id = ?1 LIMIT 1"),
+                    [asset_id.to_string()],
+                    map_asset_row,
+                )
+                .optional()?;
+            row.map(to_asset).transpose()
+        })
+        .await
+    }
+
+    async fn find_asset_by_name(&self, name: &str) -> Result<Option<Asset>> {
+        let name = name.to_string();
+        self.blocking(move |conn| {
+            let row: Option<AssetRow> = conn
+                .query_row(
+                    &format!("SELECT {ASSET_COLUMNS} FROM assets WHERE name = ?1 LIMIT 1"),
+                    [&name],
+                    map_asset_row,
+                )
+                .optional()?;
+            row.map(to_asset).transpose()
         })
         .await
     }
@@ -205,9 +320,12 @@ impl AssetRepository for SqliteStore {
     async fn create_asset(&self, asset: &Asset) -> Result<()> {
         let asset = asset.clone();
         self.blocking(move |conn| {
-            conn.execute(
-                "INSERT INTO assets (id, name, environment, db_type, dbx_connection_id, enabled)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            let result = conn.execute(
+                "INSERT INTO assets
+                    (id, name, environment, db_type, dbx_connection_id, enabled,
+                     description, deleted_at, last_tested_at, last_test_status,
+                     created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, ?8, ?8)",
                 rusqlite::params![
                     asset.id.to_string(),
                     asset.name,
@@ -215,8 +333,409 @@ impl AssetRepository for SqliteStore {
                     asset.db_type,
                     asset.dbx_connection_id,
                     if asset.enabled { 1 } else { 0 },
+                    asset.description,
+                    to_text(asset.created_at),
                 ],
+            );
+            result.map(|_| ()).map_err(|err| map_unique_violation(err.into(), "asset name"))
+        })
+        .await
+    }
+
+    async fn update_asset(&self, asset_id: Uuid, patch: &AssetPatch) -> Result<Asset> {
+        let patch = patch.clone();
+        self.blocking(move |conn| {
+            // Build a dynamic UPDATE from the provided fields only.
+            let mut sets = vec!["updated_at = ?".to_string()];
+            let mut values: Vec<String> = vec![to_text(chrono::Utc::now())];
+            if let Some(name) = patch.name {
+                sets.push("name = ?".to_string());
+                values.push(name);
+            }
+            if let Some(environment) = patch.environment {
+                sets.push("environment = ?".to_string());
+                values.push(environment.as_str().to_string());
+            }
+            if let Some(db_type) = patch.db_type {
+                sets.push("db_type = ?".to_string());
+                values.push(db_type);
+            }
+            if let Some(description) = patch.description {
+                sets.push("description = ?".to_string());
+                values.push(description);
+            }
+            values.push(asset_id.to_string());
+            let sql = format!("UPDATE assets SET {} WHERE id = ? AND deleted_at IS NULL", sets.join(", "));
+            let updated = conn
+                .execute(&sql, rusqlite::params_from_iter(values.iter().map(|v| v as &dyn rusqlite::ToSql)))
+                .map_err(|err| map_unique_violation(err.into(), "asset name"))?;
+            if updated == 0 {
+                // Either missing/deleted, or a no-op patch on a missing row.
+                // Distinguish for a clear error.
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM assets WHERE id = ?1 AND deleted_at IS NULL)",
+                    [asset_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(BastionError::InvalidData(format!("asset not found: {asset_id}")));
+                }
+            }
+            let row: AssetRow = conn.query_row(
+                &format!("SELECT {ASSET_COLUMNS} FROM assets WHERE id = ?1"),
+                [asset_id.to_string()],
+                map_asset_row,
             )?;
+            to_asset(row)
+        })
+        .await
+    }
+
+    async fn set_asset_enabled(&self, asset_id: Uuid, enabled: bool) -> Result<()> {
+        self.blocking(move |conn| {
+            conn.execute(
+                "UPDATE assets SET enabled = ?1, updated_at = ?2
+                  WHERE id = ?3 AND deleted_at IS NULL",
+                rusqlite::params![if enabled { 1 } else { 0 }, to_text(chrono::Utc::now()), asset_id.to_string(),],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn soft_delete_asset(&self, asset_id: Uuid) -> Result<()> {
+        self.blocking(move |conn| {
+            let updated = conn.execute(
+                "UPDATE assets SET deleted_at = ?1, updated_at = ?1
+                  WHERE id = ?2 AND deleted_at IS NULL",
+                rusqlite::params![to_text(chrono::Utc::now()), asset_id.to_string()],
+            )?;
+            if updated == 0 {
+                return Err(BastionError::InvalidData(format!("asset not found: {asset_id}")));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn rebind_connection(&self, asset_id: Uuid, new_connection_id: &str) -> Result<()> {
+        let new_connection_id = new_connection_id.to_string();
+        self.blocking(move |conn| {
+            let updated = conn.execute(
+                "UPDATE assets SET dbx_connection_id = ?1, updated_at = ?2,
+                                 last_tested_at = NULL, last_test_status = NULL
+                  WHERE id = ?3 AND deleted_at IS NULL",
+                rusqlite::params![new_connection_id, to_text(chrono::Utc::now()), asset_id.to_string()],
+            )?;
+            if updated == 0 {
+                return Err(BastionError::InvalidData(format!("asset not found: {asset_id}")));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn update_test_status(
+        &self,
+        asset_id: Uuid,
+        tested_at: chrono::DateTime<chrono::Utc>,
+        status: ConnectionTestStatus,
+    ) -> Result<()> {
+        let tested_at = to_text(tested_at);
+        let status = status.as_str().to_string();
+        self.blocking(move |conn| {
+            conn.execute(
+                "UPDATE assets SET last_tested_at = ?1, last_test_status = ?2, updated_at = ?1
+                  WHERE id = ?3 AND deleted_at IS NULL",
+                rusqlite::params![tested_at, status, asset_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_assets(&self, filter: &AssetFilter, page: &PageRequest) -> Result<Page<Asset>> {
+        let filter = filter.clone();
+        let page = page.clone();
+        self.blocking(move |conn| {
+            let (page_num, page_size) = page.normalized();
+            let mut conditions = vec!["deleted_at IS NULL".to_string()];
+            let mut values: Vec<String> = Vec::new();
+
+            if !filter.include_disabled {
+                conditions.push("enabled = 1".to_string());
+            }
+            if let Some(environment) = filter.environment {
+                conditions.push("environment = ?".to_string());
+                values.push(environment.as_str().to_string());
+            }
+            if let Some(db_type) = filter.db_type {
+                conditions.push("db_type = ?".to_string());
+                values.push(db_type);
+            }
+            if let Some(name_contains) = filter.name_contains {
+                conditions.push("name LIKE ? ESCAPE '\\'".to_string());
+                values.push(format!("%{}%", escape_like(&name_contains)));
+            }
+            if let Some(group_id) = filter.group_id {
+                conditions.push("id IN (SELECT asset_id FROM asset_group_members WHERE group_id = ?)".to_string());
+                values.push(group_id.to_string());
+            }
+            let where_clause = conditions.join(" AND ");
+            // Sort column comes from the enum (whitelist by construction).
+            // Sort column comes from the enum (whitelist by construction);
+            // `id` is a stable tiebreaker so pagination is deterministic.
+            let order =
+                format!("ORDER BY {} {}, id ASC", page.sort_by.column(), if page.sort_desc { "DESC" } else { "ASC" });
+
+            let total: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM assets WHERE {where_clause}"),
+                rusqlite::params_from_iter(values.iter().map(|v| v as &dyn rusqlite::ToSql)),
+                |row| row.get(0),
+            )?;
+
+            values.push((page_size as i64).to_string());
+            values.push((((page_num - 1) * page_size) as i64).to_string());
+            let sql = format!("SELECT {ASSET_COLUMNS} FROM assets WHERE {where_clause} {order} LIMIT ? OFFSET ?");
+            let mut stmt = conn.prepare(&sql)?;
+            let items = stmt
+                .query_map(rusqlite::params_from_iter(values.iter().map(|v| v as &dyn rusqlite::ToSql)), map_asset_row)?
+                .map(|row| row.map_err(BastionError::from).and_then(to_asset))
+                .collect::<Result<Vec<Asset>>>()?;
+
+            Ok(Page { items, total: total as u64, page: page_num, page_size })
+        })
+        .await
+    }
+}
+
+const GROUP_COLUMNS: &str = "id, name, parent_id, description, created_at, updated_at";
+
+type GroupRow = (
+    String,         // id
+    String,         // name
+    Option<String>, // parent_id
+    String,         // description
+    String,         // created_at
+    String,         // updated_at
+);
+
+fn to_group(row: GroupRow) -> Result<AssetGroup> {
+    let (id, name, parent_id, description, created_at, updated_at) = row;
+    Ok(AssetGroup {
+        id: parse_uuid(id)?,
+        name,
+        parent_id: parent_id.map(parse_uuid).transpose()?,
+        description,
+        created_at: parse_text(&created_at)?,
+        updated_at: parse_text(&updated_at)?,
+    })
+}
+
+fn map_group_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GroupRow> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+}
+
+#[async_trait]
+impl AssetGroupRepository for SqliteStore {
+    async fn create_group(&self, group: &NewAssetGroup) -> Result<AssetGroup> {
+        let name = group.name.clone();
+        let parent_id = group.parent_id;
+        let description = group.description.clone();
+        self.blocking(move |conn| {
+            let id = Uuid::new_v4();
+            let now = chrono::Utc::now();
+            let now_text = to_text(now);
+            conn.execute(
+                "INSERT INTO asset_groups (id, name, parent_id, description, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                rusqlite::params![id.to_string(), name, parent_id.map(|v| v.to_string()), description, now_text,],
+            )
+            .map_err(|err| map_unique_violation(err.into(), "asset group name"))?;
+            Ok(AssetGroup { id, name, parent_id, description, created_at: now, updated_at: now })
+        })
+        .await
+    }
+
+    async fn find_group(&self, group_id: Uuid) -> Result<Option<AssetGroup>> {
+        self.blocking(move |conn| {
+            let row: Option<GroupRow> = conn
+                .query_row(
+                    &format!("SELECT {GROUP_COLUMNS} FROM asset_groups WHERE id = ?1 LIMIT 1"),
+                    [group_id.to_string()],
+                    map_group_row,
+                )
+                .optional()?;
+            row.map(to_group).transpose()
+        })
+        .await
+    }
+
+    async fn find_group_by_name(&self, name: &str) -> Result<Option<AssetGroup>> {
+        let name = name.to_string();
+        self.blocking(move |conn| {
+            let row: Option<GroupRow> = conn
+                .query_row(
+                    &format!("SELECT {GROUP_COLUMNS} FROM asset_groups WHERE name = ?1 LIMIT 1"),
+                    [&name],
+                    map_group_row,
+                )
+                .optional()?;
+            row.map(to_group).transpose()
+        })
+        .await
+    }
+
+    async fn update_group(&self, group_id: Uuid, patch: &UpdateAssetGroup) -> Result<AssetGroup> {
+        let patch = patch.clone();
+        self.blocking(move |conn| {
+            let mut sets = vec!["updated_at = ?".to_string()];
+            let mut values: Vec<String> = vec![to_text(chrono::Utc::now())];
+            if let Some(name) = patch.name {
+                sets.push("name = ?".to_string());
+                values.push(name);
+            }
+            if let Some(description) = patch.description {
+                sets.push("description = ?".to_string());
+                values.push(description);
+            }
+            values.push(group_id.to_string());
+            let sql = format!("UPDATE asset_groups SET {} WHERE id = ?", sets.join(", "));
+            let updated = conn
+                .execute(&sql, rusqlite::params_from_iter(values.iter().map(|v| v as &dyn rusqlite::ToSql)))
+                .map_err(|err| map_unique_violation(err.into(), "asset group name"))?;
+            if updated == 0 {
+                return Err(BastionError::InvalidData(format!("asset group not found: {group_id}")));
+            }
+            let row: GroupRow = conn.query_row(
+                &format!("SELECT {GROUP_COLUMNS} FROM asset_groups WHERE id = ?1"),
+                [group_id.to_string()],
+                map_group_row,
+            )?;
+            to_group(row)
+        })
+        .await
+    }
+
+    async fn set_group_parent(&self, group_id: Uuid, parent_id: Option<Uuid>) -> Result<AssetGroup> {
+        self.blocking(move |conn| {
+            let updated = conn.execute(
+                "UPDATE asset_groups SET parent_id = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![parent_id.map(|v| v.to_string()), to_text(chrono::Utc::now()), group_id.to_string(),],
+            )?;
+            if updated == 0 {
+                return Err(BastionError::InvalidData(format!("asset group not found: {group_id}")));
+            }
+            let row: GroupRow = conn.query_row(
+                &format!("SELECT {GROUP_COLUMNS} FROM asset_groups WHERE id = ?1"),
+                [group_id.to_string()],
+                map_group_row,
+            )?;
+            to_group(row)
+        })
+        .await
+    }
+
+    async fn delete_group(&self, group_id: Uuid) -> Result<()> {
+        self.blocking(move |conn| {
+            let deleted = conn.execute("DELETE FROM asset_groups WHERE id = ?1", [group_id.to_string()])?;
+            if deleted == 0 {
+                return Err(BastionError::InvalidData(format!("asset group not found: {group_id}")));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_groups(&self) -> Result<Vec<AssetGroup>> {
+        self.blocking(move |conn| {
+            let sql = format!("SELECT {GROUP_COLUMNS} FROM asset_groups ORDER BY name ASC");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], map_group_row).map_err(BastionError::from)?;
+            let groups: Vec<AssetGroup> =
+                rows.map(|row| row.map_err(BastionError::from).and_then(to_group)).collect::<Result<Vec<_>>>()?;
+            Ok(groups)
+        })
+        .await
+    }
+
+    async fn child_groups(&self, group_id: Uuid) -> Result<Vec<AssetGroup>> {
+        self.blocking(move |conn| {
+            let sql = format!("SELECT {GROUP_COLUMNS} FROM asset_groups WHERE parent_id = ?1 ORDER BY name ASC");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([group_id.to_string()], map_group_row).map_err(BastionError::from)?;
+            let groups: Vec<AssetGroup> =
+                rows.map(|row| row.map_err(BastionError::from).and_then(to_group)).collect::<Result<Vec<_>>>()?;
+            Ok(groups)
+        })
+        .await
+    }
+
+    async fn add_asset_to_group(&self, asset_id: Uuid, group_id: Uuid) -> Result<()> {
+        self.blocking(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO asset_group_members (asset_id, group_id) VALUES (?1, ?2)",
+                rusqlite::params![asset_id.to_string(), group_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn remove_asset_from_group(&self, asset_id: Uuid, group_id: Uuid) -> Result<()> {
+        self.blocking(move |conn| {
+            conn.execute(
+                "DELETE FROM asset_group_members WHERE asset_id = ?1 AND group_id = ?2",
+                rusqlite::params![asset_id.to_string(), group_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Counts non-deleted member assets (deleted assets don't block group
+    /// deletion).
+    async fn group_member_count(&self, group_id: Uuid) -> Result<u64> {
+        self.blocking(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM asset_group_members m
+                  JOIN assets a ON a.id = m.asset_id
+                 WHERE m.group_id = ?1 AND a.deleted_at IS NULL",
+                [group_id.to_string()],
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
+        })
+        .await
+    }
+
+    async fn asset_groups(&self, asset_id: Uuid) -> Result<Vec<AssetGroup>> {
+        self.blocking(move |conn| {
+            let sql = format!(
+                "SELECT {GROUP_COLUMNS} FROM asset_groups g
+                  JOIN asset_group_members m ON m.group_id = g.id
+                 WHERE m.asset_id = ?1
+                 ORDER BY g.name ASC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([asset_id.to_string()], map_group_row).map_err(BastionError::from)?;
+            let groups: Vec<AssetGroup> =
+                rows.map(|row| row.map_err(BastionError::from).and_then(to_group)).collect::<Result<Vec<_>>>()?;
+            Ok(groups)
+        })
+        .await
+    }
+
+    async fn set_asset_groups(&self, asset_id: Uuid, group_ids: &[Uuid]) -> Result<()> {
+        let group_ids: Vec<String> = group_ids.iter().map(|id| id.to_string()).collect();
+        self.in_transaction(move |tx| {
+            tx.execute("DELETE FROM asset_group_members WHERE asset_id = ?1", [asset_id.to_string()])?;
+            for group_id in &group_ids {
+                tx.execute(
+                    "INSERT INTO asset_group_members (asset_id, group_id) VALUES (?1, ?2)",
+                    rusqlite::params![asset_id.to_string(), group_id],
+                )?;
+            }
             Ok(())
         })
         .await

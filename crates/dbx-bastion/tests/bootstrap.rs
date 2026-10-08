@@ -55,6 +55,8 @@ fn applied_versions(conn: &Connection) -> Vec<String> {
 
 const EXPECTED_TABLES: &[&str] = &[
     "approval_requests",
+    "asset_group_members",
+    "asset_groups",
     "assets",
     "audit_events",
     "bootstrap_state",
@@ -68,6 +70,11 @@ const EXPECTED_TABLES: &[&str] = &[
 ];
 
 const EXPECTED_INDEXES: &[&str] = &[
+    "idx_asset_group_members_asset",
+    "idx_asset_group_members_group",
+    "idx_asset_groups_parent",
+    "idx_assets_deleted",
+    "idx_assets_name_unique",
     "idx_audit_events_asset",
     "idx_audit_events_started",
     "idx_audit_events_user",
@@ -93,7 +100,10 @@ async fn fresh_init_creates_schema_and_records_version() {
     for expected in EXPECTED_INDEXES {
         assert!(indexes.iter().any(|i| i == expected), "missing index {expected}; have {indexes:?}");
     }
-    assert_eq!(applied_versions(&conn), vec!["0001_init".to_string(), "0002_auth".to_string()]);
+    assert_eq!(
+        applied_versions(&conn),
+        vec!["0001_init".to_string(), "0002_auth".to_string(), "0003_assets".to_string()]
+    );
 
     let foreign_keys: i64 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0)).unwrap();
     assert_eq!(foreign_keys, 1, "foreign_keys pragma must be ON");
@@ -113,6 +123,12 @@ async fn migration_is_idempotent_and_preserves_data() {
         db_type: "mysql".to_string(),
         dbx_connection_id: "conn-123".to_string(),
         enabled: true,
+        description: String::new(),
+        deleted_at: None,
+        last_tested_at: None,
+        last_test_status: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
     };
 
     {
@@ -132,7 +148,7 @@ async fn migration_is_idempotent_and_preserves_data() {
     }
 
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(applied_versions(&conn).len(), 2, "migration versions must not be recorded twice");
+    assert_eq!(applied_versions(&conn).len(), 3, "migration versions must not be recorded twice");
     drop(conn);
     cleanup(&path);
 }
@@ -155,6 +171,12 @@ async fn asset_repository_roundtrip_and_disabled_filtering() {
         db_type: "mysql".to_string(),
         dbx_connection_id: "conn-999".to_string(),
         enabled: false,
+        description: String::new(),
+        deleted_at: None,
+        last_tested_at: None,
+        last_test_status: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
     };
     AssetRepository::create_asset(service.store().as_ref(), &disabled).await.expect("insert disabled asset");
     let resolved =

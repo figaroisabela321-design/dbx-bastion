@@ -44,6 +44,7 @@ pub use error::{BastionError, Result};
 use std::path::Path;
 use std::sync::Arc;
 
+use asset::{AssetService, DbxConnectionAdapter};
 use auth::{AuthConfig, AuthService};
 use storage::SqliteStore;
 
@@ -77,5 +78,12 @@ impl BastionService {
     /// rate limiter) rather than constructing its own.
     pub fn auth(&self) -> &AuthService {
         &self.auth
+    }
+
+    /// Asset management services. The caller injects the DBX connection
+    /// adapter: tests pass the mock, production passes the real dbx-web
+    /// adapter (later TASK) or [`asset::UnavailableDbxConnectionAdapter`].
+    pub fn asset_service(&self, dbx: Arc<dyn DbxConnectionAdapter>) -> AssetService {
+        AssetService::new(self.store.clone(), dbx)
     }
 }
