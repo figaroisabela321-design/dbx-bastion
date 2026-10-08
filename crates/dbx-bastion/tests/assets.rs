@@ -20,7 +20,8 @@ use dbx_bastion::asset::{
     UpdateAsset, UpdateAssetGroup, UserRepository, MAX_PAGE_SIZE,
 };
 use dbx_bastion::auth::{
-    AdminBootstrap, BootstrapCredentials, BootstrapPolicy, LoginRequest, PasswordConfig, PasswordService, Principal,
+    AdminBootstrap, AuthenticatedPrincipal, BootstrapCredentials, BootstrapPolicy, LoginRequest, PasswordConfig,
+    PasswordService,
 };
 use dbx_bastion::error::BastionError;
 use dbx_bastion::storage::apply_one_migration;
@@ -65,7 +66,7 @@ impl Ctx {
         format!("{username}-password-1")
     }
 
-    async fn make_admin(&self, username: &str) -> Principal {
+    async fn make_admin(&self, username: &str) -> AuthenticatedPrincipal {
         let bootstrap =
             AdminBootstrap::new(self.service.store().clone(), self.passwords.clone(), BootstrapPolicy::default());
         bootstrap
@@ -75,7 +76,7 @@ impl Ctx {
         self.login(username).await
     }
 
-    async fn make_user(&self, username: &str) -> Principal {
+    async fn make_user(&self, username: &str) -> AuthenticatedPrincipal {
         let hash = self.passwords.hash(&Self::password_for(username)).await.expect("hash");
         self.service
             .store()
@@ -89,8 +90,9 @@ impl Ctx {
         self.login(username).await
     }
 
-    async fn login(&self, username: &str) -> Principal {
-        self.service
+    async fn login(&self, username: &str) -> AuthenticatedPrincipal {
+        let result = self
+            .service
             .auth()
             .login(&LoginRequest {
                 username: username.to_string(),
@@ -99,8 +101,8 @@ impl Ctx {
                 user_agent: None,
             })
             .await
-            .expect("login")
-            .principal
+            .expect("login");
+        self.service.auth().authenticate(&result.token).await.expect("authenticate")
     }
 
     fn new_asset(&self, name: &str) -> NewAsset {
@@ -118,7 +120,7 @@ impl Ctx {
         }
     }
 
-    async fn create_asset(&self, admin: &Principal, name: &str) -> dbx_bastion::asset::Asset {
+    async fn create_asset(&self, admin: &AuthenticatedPrincipal, name: &str) -> dbx_bastion::asset::Asset {
         self.assets().create_asset(admin, self.new_asset(name)).await.expect("create asset")
     }
 }
@@ -237,63 +239,109 @@ async fn non_admin_cannot_manage_assets() {
     );
     assert_forbidden(assets.get_asset(&user, asset.id).await.map(|_| ()));
     assert_forbidden(assets.list_assets(&user, AssetFilter::default(), Default::default()).await.map(|_| ()));
-    // Default deny: even the credential-free views are admin-only until
-    // the TASK-004 RBAC engine provides grant-scoped visibility.
-    assert_forbidden(assets.get_asset_view(&user, asset.id).await.map(|_| ()));
-    assert_forbidden(assets.list_asset_views(&user, AssetFilter::default(), Default::default()).await.map(|_| ()));
-    // The admin can still use the views (DTO hides the connection id).
-    let view = assets.get_asset_view(&admin, asset.id).await.unwrap();
-    assert_eq!(view.name, "guarded-db");
+    // RBAC visibility: without a CONNECT grant the credential-free views
+    // hide the asset (404-unified), and the listing is empty.
+    assert_not_found(assets.get_asset_view(&user, asset.id).await.map(|_| ()));
+    let page = assets.list_asset_views(&user, AssetFilter::default(), Default::default()).await.unwrap();
+    assert_eq!(page.total, 0);
+    // Platform admin without a CONNECT grant: management views work, data
+    // views stay hidden (admin identity != data permission).
+    let full = assets.get_asset(&admin, asset.id).await.unwrap();
+    assert_eq!(full.name, "guarded-db");
+    assert_not_found(assets.get_asset_view(&admin, asset.id).await.map(|_| ()));
 }
 
-// ---- 3b. default-deny on views: user/admin/disabled/role-revoked ---------
+// ---- 3b. RBAC visibility on views: CONNECT-gated, 404-unified ---------
+
+fn assert_not_found(result: Result<impl std::fmt::Debug, BastionError>) {
+    assert!(matches!(result, Err(BastionError::NotFound(_))), "expected NotFound, got {result:?}");
+}
 
 #[tokio::test]
-async fn view_default_deny_user_admin_disabled_revoked() {
-    let ctx = Ctx::new("view-deny").await;
+async fn view_rbac_visibility_connect_gated() {
+    use dbx_bastion::auth::session::SystemClock;
+    use dbx_bastion::rbac::{Action, AssetScope, Effect, GrantService, NewGrant};
+
+    let ctx = Ctx::new("view-rbac").await;
     let admin = ctx.make_admin("assetadmin").await;
     let user = ctx.make_user("mallory").await;
     let assets = ctx.assets();
-    let asset = ctx.create_asset(&admin, "denied-db").await;
+    let asset = ctx.create_asset(&admin, "guarded-db").await;
 
-    // Ordinary authenticated user: denied on both views.
-    assert_forbidden(assets.get_asset_view(&user, asset.id).await.map(|_| ()));
-    assert_forbidden(assets.list_asset_views(&user, AssetFilter::default(), Default::default()).await.map(|_| ()));
+    let grants = GrantService::new(ctx.service.store().clone(), Arc::new(SystemClock));
+    let role_id = grants.create_role(&admin, "analyst", "").await.unwrap();
+    grants.assign_role_to_user(&admin, user.user_id(), role_id).await.unwrap();
 
-    // Platform admin (re-verified against the DB): allowed.
-    let view = assets.get_asset_view(&admin, asset.id).await.unwrap();
+    // Ordinary user without CONNECT: single view and listing both hide the
+    // asset, indistinguishably from "does not exist".
+    assert_not_found(assets.get_asset_view(&user, asset.id).await.map(|_| ()));
+    let page = assets.list_asset_views(&user, AssetFilter::default(), Default::default()).await.unwrap();
+    assert_eq!(page.total, 0);
+    assert!(page.items.is_empty());
+    // Unknown ids are indistinguishable from unauthorized ones.
+    assert_not_found(assets.get_asset_view(&user, Uuid::new_v4()).await.map(|_| ()));
+
+    // Platform admin without a CONNECT grant: management identity confers
+    // no data visibility either.
+    assert_not_found(assets.get_asset_view(&admin, asset.id).await.map(|_| ()));
+
+    // Grant CONNECT: the asset becomes visible with identical results on
+    // both views.
+    grants
+        .create_grant(
+            &admin,
+            NewGrant {
+                role_id,
+                effect: Effect::Allow,
+                action: Action::Connect,
+                scope: AssetScope::Asset(asset.id),
+                database: None,
+                schema: None,
+                table: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    let view = assets.get_asset_view(&user, asset.id).await.unwrap();
     assert_eq!(view.id, asset.id);
-    let page = assets.list_asset_views(&admin, AssetFilter::default(), Default::default()).await.unwrap();
+    assert_eq!(view.name, "guarded-db");
+    let page = assets.list_asset_views(&user, AssetFilter::default(), Default::default()).await.unwrap();
     assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].id, asset.id);
 
-    // Disabled admin: rejected even with a previously valid principal.
-    ctx.service.store().set_user_enabled(admin.user_id, false).await.unwrap();
-    let err = assets.get_asset_view(&admin, asset.id).await.unwrap_err();
-    assert!(matches!(err, BastionError::AuthenticationFailed), "disabled admin must be rejected, got {err:?}");
-    ctx.service.store().set_user_enabled(admin.user_id, true).await.unwrap();
+    // Disabled user: sessions are revoked atomically with the disable, so
+    // the snapshot denies and views hide the asset again.
+    ctx.service.store().set_user_enabled(user.user_id(), false).await.unwrap();
+    assert_not_found(assets.get_asset_view(&user, asset.id).await.map(|_| ()));
+    // Re-enabling does NOT resurrect the revoked session: still hidden.
+    // This proves the snapshot re-validates session state per call.
+    ctx.service.store().set_user_enabled(user.user_id(), true).await.unwrap();
+    assert_not_found(assets.get_asset_view(&user, asset.id).await.map(|_| ()));
+    // Fresh login after re-enable: the grant still applies, visible again
+    // on the next call (no permission caching).
+    let user = ctx.login("mallory").await;
+    assets.get_asset_view(&user, asset.id).await.unwrap();
 
-    // Role revoked out-of-band: the next call fails immediately, even
-    // though the Principal snapshot still lists bastion-admin.
-    assert!(admin.roles.contains(&"bastion-admin".to_string()));
-    {
-        let conn = rusqlite::Connection::open(&ctx.db_path).unwrap();
-        conn.execute("DELETE FROM user_roles WHERE user_id = ?1", [admin.user_id.to_string()]).unwrap();
-    }
-    assert_forbidden(assets.get_asset_view(&admin, asset.id).await.map(|_| ()));
-    assert_forbidden(assets.list_asset_views(&admin, AssetFilter::default(), Default::default()).await.map(|_| ()));
+    // Role revoked out-of-band: the next call hides the asset immediately.
+    grants.remove_role_from_user(&admin, user.user_id(), role_id).await.unwrap();
+    assert_not_found(assets.get_asset_view(&user, asset.id).await.map(|_| ()));
+    let page = assets.list_asset_views(&user, AssetFilter::default(), Default::default()).await.unwrap();
+    assert_eq!(page.total, 0);
 }
 
 #[tokio::test]
 async fn guard_rereads_roles_from_db() {
     let ctx = Ctx::new("stale-roles").await;
     let admin = ctx.make_admin("assetadmin").await;
-    assert!(admin.roles.contains(&"bastion-admin".to_string()));
+    // Sanity: the admin really has the role before we revoke it.
+    assert!(ctx.service.store().user_role_names(admin.user_id()).await.unwrap().contains(&"bastion-admin".to_string()));
 
-    // Revoke the role out-of-band: the Principal snapshot still claims
-    // bastion-admin, but the guard must re-read and refuse.
+    // Revoke the role out-of-band: the guard must re-read the database
+    // and refuse, regardless of when the principal was authenticated.
     {
         let conn = rusqlite::Connection::open(&ctx.db_path).unwrap();
-        conn.execute("DELETE FROM user_roles WHERE user_id = ?1", [admin.user_id.to_string()]).unwrap();
+        conn.execute("DELETE FROM user_roles WHERE user_id = ?1", [admin.user_id().to_string()]).unwrap();
     }
     let err = ctx.assets().create_asset(&admin, ctx.new_asset("stale-role")).await.unwrap_err();
     assert!(matches!(err, BastionError::Forbidden(_)), "stale role snapshot must not authorize, got {err:?}");
@@ -305,7 +353,7 @@ async fn guard_rereads_roles_from_db() {
 async fn disabled_admin_cannot_manage_assets() {
     let ctx = Ctx::new("disabled-admin").await;
     let admin = ctx.make_admin("assetadmin").await;
-    ctx.service.store().set_user_enabled(admin.user_id, false).await.unwrap();
+    ctx.service.store().set_user_enabled(admin.user_id(), false).await.unwrap();
 
     let err = ctx.assets().create_asset(&admin, ctx.new_asset("nope")).await.unwrap_err();
     assert!(matches!(err, BastionError::AuthenticationFailed), "disabled admin must be rejected, got {err:?}");
@@ -315,10 +363,35 @@ async fn disabled_admin_cannot_manage_assets() {
 
 #[tokio::test]
 async fn asset_surfaces_carry_no_credentials() {
+    use dbx_bastion::auth::session::SystemClock;
+    use dbx_bastion::rbac::{Action, AssetScope, Effect, GrantService, NewGrant};
+
     let ctx = Ctx::new("no-creds").await;
     let admin = ctx.make_admin("assetadmin").await;
     let assets = ctx.assets();
     let asset = ctx.create_asset(&admin, "vault-db").await;
+
+    // Grant the admin CONNECT so the view is reachable; the view must
+    // still carry no connection reference.
+    let grants = GrantService::new(ctx.service.store().clone(), Arc::new(SystemClock));
+    let role_id = grants.create_role(&admin, "viewer", "").await.unwrap();
+    grants.assign_role_to_user(&admin, admin.user_id(), role_id).await.unwrap();
+    grants
+        .create_grant(
+            &admin,
+            NewGrant {
+                role_id,
+                effect: Effect::Allow,
+                action: Action::Connect,
+                scope: AssetScope::Asset(asset.id),
+                database: None,
+                schema: None,
+                table: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
 
     // Full admin record serialized: must not contain password material.
     // (dbx_connection_id is an opaque reference, not a credential, but it
@@ -751,8 +824,8 @@ async fn migration_0002_to_0003_upgrade() {
         .unwrap();
     }
 
-    // Opening applies 0003 on top of the 0002 database.
-    let service = BastionService::open(&db_path).expect("open applies 0003");
+    // Opening applies 0003 and 0004 on top of the 0002 database.
+    let service = BastionService::open(&db_path).expect("open applies 0003+0004");
     let store = service.store().clone();
 
     // Existing data survives with backfilled defaults.
@@ -791,7 +864,7 @@ fn migration_idempotent_and_failed_migration_rolls_back() {
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
-    assert_eq!(versions, vec!["0001_init", "0002_auth", "0003_assets"]);
+    assert_eq!(versions, vec!["0001_init", "0002_auth", "0003_assets", "0004_rbac"]);
 
     // A failing migration records nothing and leaves no partial schema.
     let mut conn = conn;

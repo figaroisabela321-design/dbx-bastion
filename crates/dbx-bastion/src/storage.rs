@@ -28,15 +28,14 @@ use crate::asset::{
     UserRepository,
 };
 use crate::auth::session::{parse_text, to_text, SessionRecord, SessionRepository};
-use crate::auth::Principal;
 use crate::error::{BastionError, Result};
-use crate::rbac::{Action, AuthorizationRepository, Effect, PermissionRule};
 
 /// Ordered migrations. Add new files here; never edit an applied one.
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("../migrations/0001_init.sql")),
     ("0002_auth", include_str!("../migrations/0002_auth.sql")),
     ("0003_assets", include_str!("../migrations/0003_assets.sql")),
+    ("0004_rbac", include_str!("../migrations/0004_rbac.sql")),
 ];
 
 /// SQLITE_CONSTRAINT_UNIQUE extended error code.
@@ -44,7 +43,7 @@ const SQLITE_CONSTRAINT_UNIQUE: i32 = 2067;
 
 /// Map a unique-constraint violation to a friendly error; pass anything
 /// else through unchanged.
-fn map_unique_violation(err: BastionError, what: &str) -> BastionError {
+pub(crate) fn map_unique_violation(err: BastionError, what: &str) -> BastionError {
     if let BastionError::Storage(rusqlite::Error::SqliteFailure(sqlite_err, _)) = &err {
         if sqlite_err.extended_code == SQLITE_CONSTRAINT_UNIQUE {
             return BastionError::InvalidData(format!("{what} already exists"));
@@ -88,7 +87,7 @@ impl SqliteStore {
     }
 
     /// Run a blocking rusqlite closure without stalling the async executor.
-    async fn blocking<F, T>(&self, f: F) -> Result<T>
+    pub(crate) async fn blocking<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
@@ -120,6 +119,35 @@ impl SqliteStore {
             let result = f(&tx)?;
             tx.commit()?;
             Ok(result)
+        })
+        .await
+        .map_err(|error| BastionError::StorageTask(format!("storage task join failed: {error}")))?
+    }
+
+    /// Run a closure inside a single `BEGIN DEFERRED` **read** transaction.
+    ///
+    /// Authorization snapshots are built with this: the Deferred behavior
+    /// takes a shared lock on first read, so every SELECT in the closure
+    /// sees the same database state. Combined with the store's single
+    /// mutex-guarded connection (no writer can interleave while the guard
+    /// is held), this is a true consistency snapshot — not a series of
+    /// independent autocommit reads. The transaction is rolled back
+    /// (never committed); callers must not write inside it.
+    pub(crate) async fn in_read_transaction<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn.lock().map_err(|_| BastionError::StorageTask("sqlite mutex poisoned".into()))?;
+            let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+            let result = f(&tx);
+            // Explicit rollback: this is a read-only snapshot. Dropping an
+            // open Deferred transaction would also roll back, but being
+            // explicit documents the intent.
+            tx.rollback()?;
+            result
         })
         .await
         .map_err(|error| BastionError::StorageTask(format!("storage task join failed: {error}")))?
@@ -187,11 +215,11 @@ pub fn apply_one_migration(conn: &mut Connection, version: &str, sql: &str) -> R
     Ok(())
 }
 
-fn parse_uuid(value: String) -> Result<Uuid> {
+pub(crate) fn parse_uuid(value: String) -> Result<Uuid> {
     Uuid::parse_str(&value).map_err(|error| BastionError::InvalidData(error.to_string()))
 }
 
-const ASSET_COLUMNS: &str = "id, name, environment, db_type, dbx_connection_id, enabled, description, deleted_at, last_tested_at, last_test_status, created_at, updated_at";
+pub(crate) const ASSET_COLUMNS: &str = "id, name, environment, db_type, dbx_connection_id, enabled, description, deleted_at, last_tested_at, last_test_status, created_at, updated_at";
 
 /// Raw asset row in ASSET_COLUMNS order.
 type AssetRow = (
@@ -209,7 +237,7 @@ type AssetRow = (
     String,         // updated_at
 );
 
-fn to_asset(row: AssetRow) -> Result<Asset> {
+pub(crate) fn to_asset(row: AssetRow) -> Result<Asset> {
     let (
         id,
         name,
@@ -246,7 +274,7 @@ fn to_asset(row: AssetRow) -> Result<Asset> {
     })
 }
 
-fn map_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
+pub(crate) fn map_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -266,6 +294,40 @@ fn map_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
 /// Escape LIKE wildcards in user input (`\`, `%`, `_`).
 fn escape_like(value: &str) -> String {
     value.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// Shared WHERE-clause builder for asset listings: SQL conditions plus
+/// bound values in order. Used by both the admin listing and the
+/// authorization-filtered listing so filter semantics cannot drift.
+pub(crate) fn asset_filter_conditions(filter: &AssetFilter) -> (Vec<String>, Vec<String>) {
+    let mut conditions = vec!["deleted_at IS NULL".to_string()];
+    let mut values: Vec<String> = Vec::new();
+
+    if !filter.include_disabled {
+        conditions.push("enabled = 1".to_string());
+    }
+    if let Some(environment) = filter.environment {
+        conditions.push("environment = ?".to_string());
+        values.push(environment.as_str().to_string());
+    }
+    if let Some(db_type) = filter.db_type.clone() {
+        conditions.push("db_type = ?".to_string());
+        values.push(db_type);
+    }
+    if let Some(name_contains) = filter.name_contains.clone() {
+        conditions.push("name LIKE ? ESCAPE '\\'".to_string());
+        values.push(format!("%{}%", escape_like(&name_contains)));
+    }
+    if let Some(group_id) = filter.group_id {
+        conditions.push("id IN (SELECT asset_id FROM asset_group_members WHERE group_id = ?)".to_string());
+        values.push(group_id.to_string());
+    }
+    (conditions, values)
+}
+
+/// Build `?, ?, ...` placeholders for an IN list.
+pub(crate) fn in_placeholders(count: usize) -> String {
+    (0..count).map(|_| "?").collect::<Vec<_>>().join(", ")
 }
 
 #[async_trait]
@@ -459,28 +521,7 @@ impl AssetRepository for SqliteStore {
         let page = page.clone();
         self.blocking(move |conn| {
             let (page_num, page_size) = page.normalized();
-            let mut conditions = vec!["deleted_at IS NULL".to_string()];
-            let mut values: Vec<String> = Vec::new();
-
-            if !filter.include_disabled {
-                conditions.push("enabled = 1".to_string());
-            }
-            if let Some(environment) = filter.environment {
-                conditions.push("environment = ?".to_string());
-                values.push(environment.as_str().to_string());
-            }
-            if let Some(db_type) = filter.db_type {
-                conditions.push("db_type = ?".to_string());
-                values.push(db_type);
-            }
-            if let Some(name_contains) = filter.name_contains {
-                conditions.push("name LIKE ? ESCAPE '\\'".to_string());
-                values.push(format!("%{}%", escape_like(&name_contains)));
-            }
-            if let Some(group_id) = filter.group_id {
-                conditions.push("id IN (SELECT asset_id FROM asset_group_members WHERE group_id = ?)".to_string());
-                values.push(group_id.to_string());
-            }
+            let (conditions, mut values) = asset_filter_conditions(&filter);
             let where_clause = conditions.join(" AND ");
             // Sort column comes from the enum (whitelist by construction).
             // Sort column comes from the enum (whitelist by construction);
@@ -894,50 +935,6 @@ impl UserRepository for SqliteStore {
             let names =
                 stmt.query_map([user_id.to_string()], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
             Ok(names)
-        })
-        .await
-    }
-}
-
-#[async_trait]
-impl AuthorizationRepository for SqliteStore {
-    async fn permission_rules(&self, principal: &Principal, action: Action) -> Result<Vec<PermissionRule>> {
-        let user_id = principal.user_id;
-        let action_name = action.as_str().to_string();
-        self.blocking(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT p.effect, p.action, p.asset_id,
-                        p.database_pattern, p.schema_pattern, p.table_pattern
-                   FROM permissions p
-                   JOIN user_roles ur ON ur.role_id = p.role_id
-                  WHERE ur.user_id = ?1
-                    AND p.action = ?2",
-            )?;
-            let raw: Vec<(String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = stmt
-                .query_map(rusqlite::params![user_id.to_string(), action_name], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-            raw.into_iter()
-                .map(|(effect, action, asset_id, database_pattern, schema_pattern, table_pattern)| {
-                    Ok(PermissionRule {
-                        effect: match effect.as_str() {
-                            "deny" => Effect::Deny,
-                            "allow" => Effect::Allow,
-                            other => {
-                                return Err(BastionError::InvalidData(format!("unknown permission effect: {other}")))
-                            }
-                        },
-                        action: Action::parse(&action)
-                            .ok_or_else(|| BastionError::InvalidData(format!("unknown permission action: {action}")))?,
-                        asset_id: asset_id.map(parse_uuid).transpose()?,
-                        database_pattern,
-                        schema_pattern,
-                        table_pattern,
-                    })
-                })
-                .collect()
         })
         .await
     }

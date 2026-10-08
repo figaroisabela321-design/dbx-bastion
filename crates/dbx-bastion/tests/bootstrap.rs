@@ -59,12 +59,15 @@ const EXPECTED_TABLES: &[&str] = &[
     "asset_groups",
     "assets",
     "audit_events",
+    "group_roles",
     "bootstrap_state",
     "execution_tickets",
     "permissions",
     "roles",
     "schema_migrations",
     "sessions",
+    "user_group_members",
+    "user_groups",
     "user_roles",
     "users",
 ];
@@ -79,10 +82,14 @@ const EXPECTED_INDEXES: &[&str] = &[
     "idx_audit_events_started",
     "idx_audit_events_user",
     "idx_execution_tickets_lookup",
+    "idx_group_roles_group",
+    "idx_permissions_asset",
+    "idx_permissions_asset_group",
     "idx_permissions_role_action",
     "idx_sessions_token",
     "idx_sessions_user",
     "idx_sessions_user_active",
+    "idx_user_group_members_user",
 ];
 
 #[tokio::test]
@@ -102,7 +109,7 @@ async fn fresh_init_creates_schema_and_records_version() {
     }
     assert_eq!(
         applied_versions(&conn),
-        vec!["0001_init".to_string(), "0002_auth".to_string(), "0003_assets".to_string()]
+        vec!["0001_init".to_string(), "0002_auth".to_string(), "0003_assets".to_string(), "0004_rbac".to_string()]
     );
 
     let foreign_keys: i64 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0)).unwrap();
@@ -148,7 +155,7 @@ async fn migration_is_idempotent_and_preserves_data() {
     }
 
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(applied_versions(&conn).len(), 3, "migration versions must not be recorded twice");
+    assert_eq!(applied_versions(&conn).len(), 4, "migration versions must not be recorded twice");
     drop(conn);
     cleanup(&path);
 }

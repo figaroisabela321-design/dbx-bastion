@@ -38,6 +38,7 @@ pub mod policy;
 pub mod query;
 pub mod rbac;
 pub mod storage;
+pub(crate) mod storage_rbac;
 
 pub use error::{BastionError, Result};
 

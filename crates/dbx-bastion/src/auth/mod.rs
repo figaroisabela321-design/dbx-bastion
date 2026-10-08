@@ -53,6 +53,10 @@ pub use session::{
 /// Always constructed by [`AuthService`]/[`SessionService`] from trusted
 /// persistent records — never from client-supplied values. `roles` is a
 /// point-in-time snapshot refreshed on every session validation.
+///
+/// NOTE: every field is `pub`, so a `Principal` value can be forged by
+/// anyone who can write Rust. It must never be used as an authorization
+/// identity proof. New code takes [`AuthenticatedPrincipal`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Principal {
     pub user_id: Uuid,
@@ -62,6 +66,51 @@ pub struct Principal {
     pub roles: Vec<String>,
     /// Source IP observed by the server for the session's creation.
     pub source_ip: Option<String>,
+}
+
+/// Trusted identity proof for authorization decisions.
+///
+/// Unlike [`Principal`], this type **cannot be forged**: all fields are
+/// private, it does not implement `Deserialize`, and the only constructor
+/// is `pub(crate)`, called exclusively by [`SessionService::authenticate`]
+/// after full session validation against persistent records.
+///
+/// Trust boundary (also documented on the RBAC snapshot):
+/// - PROVES: at issuance, `user_id` owned a live session (`session_id`)
+///   — token hash matched, session not revoked, not expired, idle
+///   timeout respected, user row exists and is enabled.
+/// - DOES NOT PROVE: current roles, current grants, current asset state,
+///   or that the session is still valid *now*. Every `authorize` call
+///   re-reads user status, roles, group memberships, grants **and the
+///   session row itself** inside a single consistency snapshot, so
+///   revocation/disable/role-removal take effect on the next request.
+///   Holding an `AuthenticatedPrincipal` for a long time extends no trust.
+///
+/// Never constructed from client input. Never serialized across trust
+/// boundaries.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedPrincipal {
+    user_id: Uuid,
+    username: String,
+    session_id: Uuid,
+}
+
+impl AuthenticatedPrincipal {
+    pub(crate) fn new(user_id: Uuid, username: String, session_id: Uuid) -> Self {
+        Self { user_id, username, session_id }
+    }
+
+    pub fn user_id(&self) -> Uuid {
+        self.user_id
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -179,6 +228,13 @@ impl AuthService {
     /// Validate a raw session token (delegates to the session service).
     pub async fn validate_token(&self, raw_token: &str) -> Result<Principal> {
         self.sessions.validate_token(raw_token).await
+    }
+
+    /// Authenticate a raw session token and return the unforgeable
+    /// [`AuthenticatedPrincipal`]. Prefer this over [`Self::validate_token`]
+    /// for all authorization paths.
+    pub async fn authenticate(&self, raw_token: &str) -> Result<AuthenticatedPrincipal> {
+        self.sessions.authenticate(raw_token).await
     }
 
     /// Log out: revoke one session.

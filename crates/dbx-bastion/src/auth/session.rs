@@ -24,9 +24,19 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::asset::UserRepository;
-use crate::auth::Principal;
+use crate::auth::{AuthenticatedPrincipal, Principal};
 use crate::error::{BastionError, Result};
 use crate::storage::SqliteStore;
+
+/// Trusted records produced by session validation, before being wrapped
+/// in an identity type ([`Principal`] or [`AuthenticatedPrincipal`]).
+struct ValidatedSession {
+    user_id: Uuid,
+    username: String,
+    display_name: String,
+    session_id: Uuid,
+    source_ip: Option<String>,
+}
 
 /// Time source. Production uses [`SystemClock`]; tests use [`ManualClock`].
 pub trait Clock: Send + Sync + std::fmt::Debug {
@@ -313,7 +323,38 @@ impl SessionService {
     /// missing/disabled user all yield [`BastionError::InvalidSession`]
     /// without distinguishing the cause. Roles are re-read from the
     /// database on every call.
+    ///
+    /// Prefer [`Self::authenticate`] for new code: it returns the
+    /// unforgeable [`AuthenticatedPrincipal`] instead of the forgeable
+    /// [`Principal`] snapshot.
     pub async fn validate_token(&self, raw_token: &str) -> Result<Principal> {
+        let validated = self.validate(raw_token).await?;
+        let roles = self.store.user_role_names(validated.user_id).await?;
+        Ok(Principal {
+            user_id: validated.user_id,
+            username: validated.username,
+            display_name: validated.display_name,
+            session_id: validated.session_id,
+            roles,
+            source_ip: validated.source_ip,
+        })
+    }
+
+    /// Authenticate a raw token and return the unforgeable
+    /// [`AuthenticatedPrincipal`].
+    ///
+    /// Runs the exact same validation as [`Self::validate_token`]; the
+    /// difference is the return type, which cannot be constructed or
+    /// deserialized outside this module.
+    pub async fn authenticate(&self, raw_token: &str) -> Result<AuthenticatedPrincipal> {
+        let validated = self.validate(raw_token).await?;
+        Ok(AuthenticatedPrincipal::new(validated.user_id, validated.username, validated.session_id))
+    }
+
+    /// Shared validation core: token -> live session -> existing enabled
+    /// user. Returns the trusted records; callers wrap them in the
+    /// appropriate identity type.
+    async fn validate(&self, raw_token: &str) -> Result<ValidatedSession> {
         let now = self.clock.now();
         let hash = token_hash(raw_token);
 
@@ -341,7 +382,6 @@ impl SessionService {
         if !user.enabled {
             return Err(BastionError::InvalidSession);
         }
-        let roles = self.store.user_role_names(user.id).await?;
 
         // Throttled activity touch. The boundary documented on
         // SessionConfig::validate guarantees an active user is never kicked
@@ -352,12 +392,11 @@ impl SessionService {
             self.store.touch_session(session.id, now).await?;
         }
 
-        Ok(Principal {
+        Ok(ValidatedSession {
             user_id: user.id,
             username: user.username,
             display_name: user.display_name,
             session_id: session.id,
-            roles,
             source_ip: session.source_ip,
         })
     }

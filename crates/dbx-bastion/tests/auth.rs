@@ -21,7 +21,7 @@ use dbx_bastion::auth::{
     SessionCookiePolicy, SessionService,
 };
 use dbx_bastion::error::BastionError;
-use dbx_bastion::rbac::{Action, AuthorizationRepository};
+use dbx_bastion::rbac::GrantService;
 use dbx_bastion::storage::{apply_one_migration, SqliteStore};
 use dbx_bastion::BastionService;
 use uuid::Uuid;
@@ -424,11 +424,12 @@ async fn bootstrap_grants_no_db_permissions() {
     let login = ctx.login("platadmin", "plat-admin-pw-1").await.unwrap();
     assert_eq!(login.principal.roles, vec!["bastion-admin".to_string()]);
 
-    // Platform admin != database operator: no implicit SELECT/DDL/EXPORT.
-    for action in [Action::Select, Action::Update, Action::Delete, Action::Ddl, Action::Export] {
-        let rules = ctx.service.store().permission_rules(&login.principal, action).await.unwrap();
-        assert!(rules.is_empty(), "bootstrap must not grant {action:?} permissions");
-    }
+    // Platform admin != database operator: bootstrap creates no grants at
+    // all, so no implicit SELECT/UPDATE/DELETE/DDL/EXPORT.
+    let admin = ctx.service.auth().authenticate(&login.token).await.unwrap();
+    let grants =
+        GrantService::new(ctx.service.store().clone(), std::sync::Arc::new(dbx_bastion::auth::session::SystemClock));
+    assert!(grants.list_grants(&admin).await.unwrap().is_empty(), "bootstrap must not create grants");
 }
 
 // ---- controlled recovery path ------------------------------------------------
@@ -547,14 +548,17 @@ async fn migration_0001_to_0002_upgrade_idempotent() {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(versions, vec!["0001_init".to_string(), "0002_auth".to_string(), "0003_assets".to_string()]);
+        assert_eq!(
+            versions,
+            vec!["0001_init".to_string(), "0002_auth".to_string(), "0003_assets".to_string(), "0004_rbac".to_string()]
+        );
     }
 
     // Reopening is idempotent: no duplicate migration, no data loss.
     let _service = BastionService::open(&db_path).unwrap();
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0)).unwrap();
-    assert_eq!(count, 3);
+    assert_eq!(count, 4);
     let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0)).unwrap();
     assert_eq!(sessions, 1);
 }

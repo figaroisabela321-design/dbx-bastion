@@ -2,9 +2,10 @@
 //!
 //! [`AssetService`] owns asset CRUD, grouping, the DBX connection mapping
 //! and connection testing. Every management operation passes through
-//! [`AssetAdminGuard`], which re-reads the caller's enabled flag and roles
-//! from the database — the `roles` snapshot on [`Principal`] is never
-//! trusted for authorization.
+//! [`AssetAdminGuard`], which takes the unforgeable
+//! [`AuthenticatedPrincipal`](crate::auth::AuthenticatedPrincipal) and
+//! re-reads the caller's enabled flag and roles from the database on
+//! every call.
 //!
 //! Credential boundary: [`NewAsset`] cannot express host/port/username/
 //! password by construction; [`crate::asset::AssetView`] cannot carry
@@ -23,8 +24,10 @@ use crate::asset::{
     PageRequest, UpdateAsset, UserRepository, SUPPORTED_DB_TYPES,
 };
 use crate::auth::bootstrap::ADMIN_ROLE_NAME;
-use crate::auth::Principal;
+use crate::auth::session::{Clock, SystemClock};
+use crate::auth::AuthenticatedPrincipal;
 use crate::error::{BastionError, Result};
+use crate::rbac::Action;
 use crate::storage::SqliteStore;
 
 /// Re-reads the caller from the trusted repository and requires the
@@ -43,8 +46,12 @@ impl AssetAdminGuard {
 
     /// Verify the caller is an enabled platform asset administrator.
     /// Returns the verified user id.
-    pub async fn check(&self, principal: &Principal) -> Result<Uuid> {
-        let user = self.store.find_user_by_id(principal.user_id).await?.ok_or(BastionError::AuthenticationFailed)?;
+    ///
+    /// The identity comes from [`AuthenticatedPrincipal`] (unforgeable,
+    /// session-validated); enabled flag and roles are re-read from the
+    /// database on every call, so revocation applies immediately.
+    pub async fn check(&self, principal: &AuthenticatedPrincipal) -> Result<Uuid> {
+        let user = self.store.find_user_by_id(principal.user_id()).await?.ok_or(BastionError::AuthenticationFailed)?;
         if !user.enabled {
             return Err(BastionError::AuthenticationFailed);
         }
@@ -60,11 +67,16 @@ pub struct AssetService {
     store: Arc<SqliteStore>,
     guard: AssetAdminGuard,
     dbx: Arc<dyn DbxConnectionAdapter>,
+    clock: Arc<dyn Clock>,
 }
 
 impl AssetService {
     pub fn new(store: Arc<SqliteStore>, dbx: Arc<dyn DbxConnectionAdapter>) -> Self {
-        Self { guard: AssetAdminGuard::new(store.clone()), store, dbx }
+        Self::with_clock(store, dbx, Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(store: Arc<SqliteStore>, dbx: Arc<dyn DbxConnectionAdapter>, clock: Arc<dyn Clock>) -> Self {
+        Self { guard: AssetAdminGuard::new(store.clone()), store, dbx, clock }
     }
 
     pub fn guard(&self) -> &AssetAdminGuard {
@@ -148,7 +160,7 @@ impl AssetService {
     /// Create an asset. The referenced DBX connection must exist; group ids
     /// must exist. Name uniqueness is enforced by the service and backed by
     /// a UNIQUE index (race-safe).
-    pub async fn create_asset(&self, principal: &Principal, input: NewAsset) -> Result<Asset> {
+    pub async fn create_asset(&self, principal: &AuthenticatedPrincipal, input: NewAsset) -> Result<Asset> {
         self.guard.check(principal).await?;
         let name = Self::validate_name(&input.name)?;
         let environment = Self::validate_environment(&input.environment)?;
@@ -193,7 +205,12 @@ impl AssetService {
 
     /// Update asset fields. `dbx_connection_id` cannot be changed here;
     /// use [`Self::rebind_connection`].
-    pub async fn update_asset(&self, principal: &Principal, asset_id: Uuid, input: UpdateAsset) -> Result<Asset> {
+    pub async fn update_asset(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        asset_id: Uuid,
+        input: UpdateAsset,
+    ) -> Result<Asset> {
         self.guard.check(principal).await?;
         let asset = self.get_usable_asset(asset_id).await?;
 
@@ -220,7 +237,12 @@ impl AssetService {
         Ok(updated)
     }
 
-    pub async fn set_asset_enabled(&self, principal: &Principal, asset_id: Uuid, enabled: bool) -> Result<Asset> {
+    pub async fn set_asset_enabled(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        asset_id: Uuid,
+        enabled: bool,
+    ) -> Result<Asset> {
         self.guard.check(principal).await?;
         let asset = self.get_usable_asset(asset_id).await?;
         self.store.set_asset_enabled(asset.id, enabled).await?;
@@ -232,7 +254,7 @@ impl AssetService {
 
     /// Soft delete. The row stays for audit/work-order history; listings
     /// and `resolve_asset` hide it. Does not touch the DBX connection.
-    pub async fn delete_asset(&self, principal: &Principal, asset_id: Uuid) -> Result<()> {
+    pub async fn delete_asset(&self, principal: &AuthenticatedPrincipal, asset_id: Uuid) -> Result<()> {
         self.guard.check(principal).await?;
         let asset = self.get_usable_asset(asset_id).await?;
         self.store.soft_delete_asset(asset.id).await
@@ -242,7 +264,7 @@ impl AssetService {
     /// new reference must exist, and ordinary update cannot rebind.
     pub async fn rebind_connection(
         &self,
-        principal: &Principal,
+        principal: &AuthenticatedPrincipal,
         asset_id: Uuid,
         new_connection_id: &str,
     ) -> Result<Asset> {
@@ -263,7 +285,7 @@ impl AssetService {
     }
 
     /// Full asset record (includes `dbx_connection_id`). Administrators only.
-    pub async fn get_asset(&self, principal: &Principal, asset_id: Uuid) -> Result<Asset> {
+    pub async fn get_asset(&self, principal: &AuthenticatedPrincipal, asset_id: Uuid) -> Result<Asset> {
         self.guard.check(principal).await?;
         self.get_usable_asset(asset_id).await
     }
@@ -271,7 +293,7 @@ impl AssetService {
     /// Paginated asset listing (full records). Administrators only.
     pub async fn list_assets(
         &self,
-        principal: &Principal,
+        principal: &AuthenticatedPrincipal,
         filter: AssetFilter,
         page: PageRequest,
     ) -> Result<Page<Asset>> {
@@ -281,32 +303,53 @@ impl AssetService {
 
     /// Credential-free view for one asset.
     ///
-    /// SECURITY (TASK-003 hardening): until the TASK-004 RBAC engine
-    /// exists, ordinary users are default-deny — this is restricted to
-    /// platform administrators re-verified against the database on every
-    /// call. The DTO guarantee (no `dbx_connection_id`, no credentials)
-    /// holds regardless.
-    pub async fn get_asset_view(&self, principal: &Principal, asset_id: Uuid) -> Result<AssetView> {
-        self.guard.check(principal).await?;
-        let asset = self
+    /// RBAC visibility: only assets with a valid CONNECT grant are shown.
+    /// Missing assets, assets without CONNECT, disabled assets and
+    /// soft-deleted assets are **indistinguishable**: all yield the same
+    /// [`BastionError::NotFound`], so callers cannot probe for asset
+    /// existence. The view is built from the authorization snapshot
+    /// itself — no second read, no TOCTOU. The DTO guarantee (no
+    /// `dbx_connection_id`, no credentials) holds regardless.
+    pub async fn get_asset_view(&self, principal: &AuthenticatedPrincipal, asset_id: Uuid) -> Result<AssetView> {
+        let snapshot = self
             .store
-            .resolve_asset(asset_id)
-            .await?
-            .ok_or_else(|| BastionError::InvalidData(format!("asset not found: {asset_id}")))?;
-        Ok(AssetView::from(&asset))
+            .authorization_snapshot(principal.user_id(), principal.session_id(), &[Action::Connect], self.clock.clone())
+            .await?;
+        let not_found = || BastionError::NotFound("asset not found".to_string());
+        let asset =
+            snapshot.assets.get(&asset_id).filter(|a| a.enabled && a.deleted_at.is_none()).ok_or_else(not_found)?;
+        if !snapshot.connect_allowed(asset_id) {
+            return Err(not_found());
+        }
+        Ok(AssetView::from(asset))
     }
 
-    /// Credential-free paginated listing. Same TASK-003 restriction as
-    /// [`Self::get_asset_view`]: administrators only until TASK-004 RBAC
-    /// replaces this with grant-scoped filtering.
+    /// Credential-free paginated listing, restricted to CONNECT-authorized
+    /// assets.
+    ///
+    /// Snapshot, authorized-id computation, filtered query and total count
+    /// all happen inside one read transaction, so pagination, search and
+    /// totals are consistent with the authorization decision and reveal
+    /// nothing about unauthorized assets. Filtering uses the same
+    /// [`connect_allowed`](crate::rbac::snapshot::AuthSnapshot::connect_allowed)
+    /// predicate as the authorizer — a single semantic, not two
+    /// implementations.
     pub async fn list_asset_views(
         &self,
-        principal: &Principal,
+        principal: &AuthenticatedPrincipal,
         filter: AssetFilter,
         page: PageRequest,
     ) -> Result<Page<AssetView>> {
-        self.guard.check(principal).await?;
-        let page_result = self.store.list_assets(&filter, &page).await?;
+        let page_result = self
+            .store
+            .list_connect_authorized_assets(
+                principal.user_id(),
+                principal.session_id(),
+                &filter,
+                &page,
+                self.clock.clone(),
+            )
+            .await?;
         let items = page_result.items.iter().map(AssetView::from).collect();
         Ok(Page { items, total: page_result.total, page: page_result.page, page_size: page_result.page_size })
     }
@@ -314,7 +357,11 @@ impl AssetService {
     /// Test the asset's DBX connection (admin action). Re-confirms the
     /// mapping, runs the test through the adapter, and records the outcome
     /// on the asset row. The report is credential-free by adapter contract.
-    pub async fn test_connection(&self, principal: &Principal, asset_id: Uuid) -> Result<ConnectionTestReport> {
+    pub async fn test_connection(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        asset_id: Uuid,
+    ) -> Result<ConnectionTestReport> {
         self.guard.check(principal).await?;
         let asset = self.get_usable_asset(asset_id).await?;
         if !self.dbx.connection_exists(&asset.dbx_connection_id).await? {
@@ -336,7 +383,7 @@ impl AssetService {
 
     // ---- groups (admin) -----------------------------------------------------
 
-    pub async fn create_group(&self, principal: &Principal, input: NewAssetGroup) -> Result<AssetGroup> {
+    pub async fn create_group(&self, principal: &AuthenticatedPrincipal, input: NewAssetGroup) -> Result<AssetGroup> {
         self.guard.check(principal).await?;
         let name = Self::validate_group_name(&input.name)?;
         let description = Self::validate_description(&input.description)?;
@@ -354,7 +401,7 @@ impl AssetService {
 
     pub async fn update_group(
         &self,
-        principal: &Principal,
+        principal: &AuthenticatedPrincipal,
         group_id: Uuid,
         input: UpdateAssetGroup,
     ) -> Result<AssetGroup> {
@@ -381,7 +428,7 @@ impl AssetService {
     /// moves cannot interleave into a cycle.
     pub async fn move_group(
         &self,
-        principal: &Principal,
+        principal: &AuthenticatedPrincipal,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
     ) -> Result<AssetGroup> {
@@ -391,7 +438,7 @@ impl AssetService {
 
     /// Delete a group. Refuses non-empty groups (members or child groups):
     /// the operator must empty the group first. No cascading deletes.
-    pub async fn delete_group(&self, principal: &Principal, group_id: Uuid) -> Result<()> {
+    pub async fn delete_group(&self, principal: &AuthenticatedPrincipal, group_id: Uuid) -> Result<()> {
         self.guard.check(principal).await?;
         self.get_group(group_id).await?;
         let members = self.store.group_member_count(group_id).await?;
@@ -404,29 +451,48 @@ impl AssetService {
                 "cannot delete group with child groups; move or delete them first".into(),
             ));
         }
+        // Grants are never cascade-deleted (ON DELETE RESTRICT): refuse
+        // with a clear error so the admin explicitly revokes them first.
+        // This prevents silently wiping DENY rules (fail open).
+        let grant_count = self.store.count_grants_for_group(group_id).await?;
+        if grant_count > 0 {
+            return Err(BastionError::InvalidData(format!(
+                "cannot delete group with {grant_count} permission grant(s); revoke them explicitly first"
+            )));
+        }
         self.store.delete_group(group_id).await
     }
 
-    pub async fn list_groups(&self, principal: &Principal) -> Result<Vec<AssetGroup>> {
+    pub async fn list_groups(&self, principal: &AuthenticatedPrincipal) -> Result<Vec<AssetGroup>> {
         self.guard.check(principal).await?;
         self.store.list_groups().await
     }
 
-    pub async fn add_asset_to_group(&self, principal: &Principal, asset_id: Uuid, group_id: Uuid) -> Result<()> {
+    pub async fn add_asset_to_group(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        asset_id: Uuid,
+        group_id: Uuid,
+    ) -> Result<()> {
         self.guard.check(principal).await?;
         self.get_usable_asset(asset_id).await?;
         self.get_group(group_id).await?;
         self.store.add_asset_to_group(asset_id, group_id).await
     }
 
-    pub async fn remove_asset_from_group(&self, principal: &Principal, asset_id: Uuid, group_id: Uuid) -> Result<()> {
+    pub async fn remove_asset_from_group(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        asset_id: Uuid,
+        group_id: Uuid,
+    ) -> Result<()> {
         self.guard.check(principal).await?;
         self.get_usable_asset(asset_id).await?;
         self.get_group(group_id).await?;
         self.store.remove_asset_from_group(asset_id, group_id).await
     }
 
-    pub async fn asset_groups(&self, principal: &Principal, asset_id: Uuid) -> Result<Vec<AssetGroup>> {
+    pub async fn asset_groups(&self, principal: &AuthenticatedPrincipal, asset_id: Uuid) -> Result<Vec<AssetGroup>> {
         self.guard.check(principal).await?;
         self.get_usable_asset(asset_id).await?;
         self.store.asset_groups(asset_id).await

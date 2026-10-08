@@ -57,6 +57,12 @@ pub enum BastionError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// Unified "not found" used where existence must not leak: unknown
+    /// asset ids, assets the caller may not see, and soft-deleted assets
+    /// all produce this same error. The web layer maps it to HTTP 404.
+    #[error("not found: {0}")]
+    NotFound(String),
+
     #[error("dbx connection adapter unavailable: {0}")]
     AdapterUnavailable(String),
 }
