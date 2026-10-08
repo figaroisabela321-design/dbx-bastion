@@ -76,3 +76,27 @@ pub struct ExecutionTicket {
     pub consumed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
+
+/// Approval service contract (TASK-005A: interface only).
+///
+/// The approved architecture is explicit: TASK-005 defines the
+/// interface and the `RequiresApproval` policy decision, but **no**
+/// ticket issuance/consumption flow is implemented in TASK-005. Until
+/// the approval service is complete, every operation the policy marks
+/// `RequireApproval` is denied by the gateway — never default-allowed.
+#[async_trait::async_trait]
+pub trait ApprovalService: Send + Sync {
+    /// Returns `true` iff `ticket_id` names a live, unconsumed ticket
+    /// bound to exactly (`user_id`, `asset_id`, `sql_hash`) and not
+    /// past `now`. Verification and consumption must be atomic
+    /// (single conditional UPDATE); a consumed or mismatched ticket
+    /// returns `false`, never an execution.
+    async fn verify_and_consume(
+        &self,
+        ticket_id: Uuid,
+        user_id: Uuid,
+        asset_id: Uuid,
+        sql_hash: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::error::Result<bool>;
+}
