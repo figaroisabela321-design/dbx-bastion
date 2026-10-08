@@ -47,4 +47,10 @@ pub enum BastionError {
 
     #[error("bootstrap error: {0}")]
     Bootstrap(String),
+
+    /// A concurrent modification invalidated this operation's precondition
+    /// (e.g. the password hash changed between verification and update).
+    /// The caller should re-read current state and retry with fresh input.
+    #[error("concurrent modification: {0}")]
+    ConcurrentModification(String),
 }

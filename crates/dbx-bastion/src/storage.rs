@@ -313,15 +313,22 @@ impl UserRepository for SqliteStore {
     }
 
     async fn set_user_enabled(&self, user_id: Uuid, enabled: bool) -> Result<()> {
-        self.blocking(move |conn| {
-            conn.execute(
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        self.in_transaction(move |tx| {
+            tx.execute(
                 "UPDATE users SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![
-                    if enabled { 1 } else { 0 },
-                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    user_id.to_string(),
-                ],
+                rusqlite::params![if enabled { 1 } else { 0 }, now, user_id.to_string(),],
             )?;
+            if !enabled {
+                // Revoke all sessions atomically with the disable. A session
+                // racing the disable is either aborted at creation (hash /
+                // enabled re-check) or revoked here; either way it can never
+                // be resurrected by a later re-enable.
+                tx.execute(
+                    "UPDATE sessions SET revoked_at = ?1 WHERE user_id = ?2 AND revoked_at IS NULL",
+                    rusqlite::params![now, user_id.to_string()],
+                )?;
+            }
             Ok(())
         })
         .await

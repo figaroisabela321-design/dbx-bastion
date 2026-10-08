@@ -152,8 +152,14 @@ impl AuthService {
 
         self.rate_limiter.record_success(&request.username, ip);
 
-        let (session, token) =
-            self.sessions.create_session(user.id, request.source_ip.clone(), request.user_agent.clone()).await?;
+        // The hash verified above is passed into session creation, which
+        // re-validates it inside the creation transaction (verify-then-create
+        // race hardening).
+        let verified_password_hash = user.password_hash.clone();
+        let (session, token) = self
+            .sessions
+            .create_session(user.id, &verified_password_hash, request.source_ip.clone(), request.user_agent.clone())
+            .await?;
         let roles = self.store.user_role_names(user.id).await?;
 
         Ok(LoginResult {
@@ -184,6 +190,12 @@ impl AuthService {
     /// Change a user's password. The old password is verified first; the
     /// hash update and the revocation of all existing sessions happen in a
     /// single transaction so no old session can survive the change.
+    ///
+    /// The update is conditional on the hash verified above
+    /// (`WHERE password_hash = ?`): if another request changed the password
+    /// concurrently, this update affects zero rows and fails with
+    /// [`BastionError::ConcurrentModification`] instead of silently
+    /// overwriting the newer password (lost update).
     pub async fn change_password(&self, user_id: Uuid, old_password: &str, new_password: &str) -> Result<()> {
         let user = self.store.find_user_by_id(user_id).await?.ok_or(BastionError::AuthenticationFailed)?;
         let ok = self.passwords.verify(old_password, &user.password_hash).await?;
@@ -193,14 +205,21 @@ impl AuthService {
         // Policy is enforced inside hash(); hashing happens before the
         // transaction so no MutexGuard is held across Argon2.
         let new_hash = self.passwords.hash(new_password).await?;
+        let verified_hash = user.password_hash.clone();
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         self.store
             .in_transaction(move |tx| {
-                tx.execute(
-                    "UPDATE users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3",
-                    rusqlite::params![new_hash, now, user_id.to_string()],
+                let updated = tx.execute(
+                    "UPDATE users SET password_hash = ?1, updated_at = ?2
+                      WHERE id = ?3 AND password_hash = ?4",
+                    rusqlite::params![new_hash, now, user_id.to_string(), verified_hash],
                 )?;
+                if updated == 0 {
+                    return Err(BastionError::ConcurrentModification(
+                        "password was changed by another request; retry with the current password".into(),
+                    ));
+                }
                 tx.execute(
                     "UPDATE sessions SET revoked_at = ?1
                       WHERE user_id = ?2 AND revoked_at IS NULL",

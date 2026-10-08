@@ -184,16 +184,26 @@ impl SessionService {
     /// Create a session and return the stored record plus the **raw token**
     /// (shown to the caller exactly once; never persisted).
     ///
-    /// The concurrency-limit check and oldest-session eviction run inside
-    /// the same transaction as the insert.
+    /// `verified_password_hash` is the hash the caller verified the password
+    /// against. Inside the same transaction that inserts the session, the
+    /// current hash and the enabled flag are re-read: if the password
+    /// changed or the user was disabled after verification, creation is
+    /// aborted with [`BastionError::AuthenticationFailed`]. This closes the
+    /// verify-then-create race — a stale credential can never mint a live
+    /// session.
+    ///
+    /// The concurrency-limit check and oldest-session eviction also run
+    /// inside the same transaction.
     pub async fn create_session(
         &self,
         user_id: Uuid,
+        verified_password_hash: &str,
         source_ip: Option<String>,
         user_agent: Option<String>,
     ) -> Result<(SessionRecord, String)> {
         let now = self.clock.now();
         let raw_token = generate_token();
+        let verified_password_hash = verified_password_hash.to_string();
         let new_session = NewSession {
             id: Uuid::new_v4(),
             user_id,
@@ -210,6 +220,26 @@ impl SessionService {
         let record = self
             .store
             .in_transaction(move |tx| {
+                // Re-validate inside the transaction: the credential verified
+                // before this call may have been superseded (password change)
+                // or the account disabled concurrently.
+                let current: Option<(String, i64)> = tx
+                    .query_row(
+                        "SELECT password_hash, enabled FROM users WHERE id = ?1",
+                        rusqlite::params![new_session.user_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((current_hash, enabled)) = current else {
+                    return Err(BastionError::AuthenticationFailed);
+                };
+                if enabled == 0 {
+                    return Err(BastionError::AuthenticationFailed);
+                }
+                if current_hash != verified_password_hash {
+                    return Err(BastionError::AuthenticationFailed);
+                }
+
                 // Evict oldest active sessions while at/over the limit.
                 loop {
                     let active: i64 = tx.query_row(

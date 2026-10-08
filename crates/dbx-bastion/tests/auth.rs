@@ -67,6 +67,11 @@ impl Ctx {
         self.service.store().clone()
     }
 
+    /// Current stored password hash (the value a login would verify against).
+    async fn user_hash(&self, user_id: Uuid) -> String {
+        self.store().find_user_by_id(user_id).await.expect("find user").expect("user exists").password_hash
+    }
+
     async fn create_user(&self, username: &str, password: &str) -> Uuid {
         let hash = self.passwords.hash(password).await.expect("hash password");
         self.store()
@@ -224,7 +229,8 @@ async fn session_expired_by_ttl() {
     let sessions = SessionService::new(ctx.store(), config, clock.clone()).unwrap();
 
     let user = ctx.create_user("dave", "dave-password-1").await;
-    let (_, token) = sessions.create_session(user, None, None).await.unwrap();
+    let hash = ctx.user_hash(user).await;
+    let (_, token) = sessions.create_session(user, &hash, None, None).await.unwrap();
     assert!(sessions.validate_token(&token).await.is_ok());
 
     clock.advance(chrono::Duration::seconds(61));
@@ -250,7 +256,8 @@ async fn session_idle_timeout_and_touch_boundary() {
     let sessions = SessionService::new(ctx.store(), config, clock.clone()).unwrap();
 
     let user = ctx.create_user("erin", "erin-password-1").await;
-    let (_, token) = sessions.create_session(user, None, None).await.unwrap();
+    let hash = ctx.user_hash(user).await;
+    let (_, token) = sessions.create_session(user, &hash, None, None).await.unwrap();
 
     // An active user (validating every 100s, each validation refreshing the
     // throttled timestamp) is never kicked, even past the absolute
@@ -817,4 +824,122 @@ async fn argon2_concurrent_correctness() {
     for handle in handles {
         assert!(handle.await.unwrap(), "concurrent verify must succeed");
     }
+}
+
+// ---- security review: verify-then-create race hardening ----------------------
+// These tests are deterministic: they drive the re-validation logic with
+// stale vs current hashes directly instead of racing wall-clock timing.
+
+#[tokio::test]
+async fn session_create_revalidates_password_hash_and_enabled() {
+    let ctx = Ctx::new("revalidate").await;
+    let store = ctx.store();
+    let sessions = ctx.auth.sessions();
+
+    let user = ctx.create_user("nina", "nina-password-1").await;
+    let stale_hash = ctx.user_hash(user).await;
+
+    // Password changed after "verification": creation with the stale hash is
+    // refused inside the creation transaction.
+    let new_hash = ctx.passwords.hash("nina-password-2").await.unwrap();
+    store.update_password_hash(user, &new_hash).await.unwrap();
+    let err = sessions.create_session(user, &stale_hash, None, None).await.unwrap_err();
+    assert!(matches!(err, BastionError::AuthenticationFailed));
+
+    // With the current hash, creation succeeds.
+    let (_, token) = sessions.create_session(user, &new_hash, None, None).await.unwrap();
+    assert!(ctx.auth.validate_token(&token).await.is_ok());
+
+    // User disabled after "verification": creation refused.
+    let current = ctx.user_hash(user).await;
+    store.set_user_enabled(user, false).await.unwrap();
+    let err = sessions.create_session(user, &current, None, None).await.unwrap_err();
+    assert!(matches!(err, BastionError::AuthenticationFailed));
+
+    // Re-enabled: creation works again with the current hash.
+    store.set_user_enabled(user, true).await.unwrap();
+    let (_, token2) = sessions.create_session(user, &current, None, None).await.unwrap();
+    assert!(ctx.auth.validate_token(&token2).await.is_ok());
+}
+
+#[tokio::test]
+async fn disable_reenable_does_not_resurrect_sessions() {
+    let ctx = Ctx::new("no-resurrect").await;
+    let store = ctx.store();
+    let user = ctx.create_user("mallory", "mallory-password-1").await;
+    let login = ctx.login("mallory", "mallory-password-1").await.unwrap();
+
+    // Disabling revokes sessions atomically (visible at the row level, not
+    // just at validation time).
+    store.set_user_enabled(user, false).await.unwrap();
+    let conn = rusqlite::Connection::open(&ctx.db_path).unwrap();
+    let revoked: Option<String> = conn
+        .query_row("SELECT revoked_at FROM sessions WHERE id = ?1", [login.principal.session_id.to_string()], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(revoked.is_some(), "disable must revoke sessions in the same tx");
+    drop(conn);
+    assert_invalid_session(ctx.auth.validate_token(&login.token).await);
+
+    // Re-enabling must NOT resurrect the disabled-period session.
+    store.set_user_enabled(user, true).await.unwrap();
+    assert_invalid_session(ctx.auth.validate_token(&login.token).await);
+
+    // A fresh login after re-enable works normally.
+    let login2 = ctx.login("mallory", "mallory-password-1").await.unwrap();
+    assert!(ctx.auth.validate_token(&login2.token).await.is_ok());
+}
+
+// ---- security review: concurrent password changes ---------------------------
+
+#[tokio::test]
+async fn concurrent_password_change_no_lost_update() {
+    let ctx = Ctx::new("pw-race").await;
+    let store = ctx.store();
+    let id = ctx.create_user("oscar", "oscar-password-1").await;
+
+    // Sequential stale attempt: the old password no longer verifies, so the
+    // request fails before reaching the conditional update; the first
+    // change is untouched.
+    ctx.auth.change_password(id, "oscar-password-1", "oscar-password-2").await.unwrap();
+    let err = ctx.auth.change_password(id, "oscar-password-1", "oscar-password-3").await.unwrap_err();
+    assert!(matches!(err, BastionError::AuthenticationFailed));
+    assert!(ctx.login("oscar", "oscar-password-2").await.is_ok());
+    assert_auth_failed(ctx.login("oscar", "oscar-password-3").await);
+
+    // Truly concurrent: both requests verified the same old password, so
+    // exactly one conditional update can win; the loser gets a retryable
+    // error instead of silently clobbering the winner. The outcome
+    // (exactly one success) is deterministic: without the conditional
+    // update both would succeed via last-writer-wins.
+    let auth = Arc::new(AuthService::new(store, fast_auth_config()).unwrap());
+    let first = Arc::clone(&auth);
+    let second = Arc::clone(&auth);
+    let first_wins =
+        tokio::spawn(async move { first.change_password(id, "oscar-password-2", "oscar-password-A").await });
+    let second_wins =
+        tokio::spawn(async move { second.change_password(id, "oscar-password-2", "oscar-password-B").await });
+    let first_result = first_wins.await.unwrap();
+    let second_result = second_wins.await.unwrap();
+    assert!(first_result.is_ok() ^ second_result.is_ok(), "exactly one concurrent password change must win");
+    let winner_password = if first_result.is_ok() {
+        assert!(matches!(second_result.unwrap_err(), BastionError::ConcurrentModification(_)));
+        "oscar-password-A"
+    } else {
+        assert!(matches!(first_result.unwrap_err(), BastionError::ConcurrentModification(_)));
+        "oscar-password-B"
+    };
+    // The winner's password is live; nothing else landed.
+    let login = ctx
+        .auth
+        .login(&LoginRequest {
+            username: "oscar".to_string(),
+            password: winner_password.to_string(),
+            source_ip: None,
+            user_agent: None,
+        })
+        .await
+        .unwrap();
+    assert!(ctx.auth.validate_token(&login.token).await.is_ok());
 }
