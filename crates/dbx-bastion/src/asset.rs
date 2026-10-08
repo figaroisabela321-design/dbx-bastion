@@ -75,7 +75,27 @@ pub struct UserCredentialRecord {
     pub enabled: bool,
 }
 
+/// Parameters for creating a user. The password hash must already be
+/// computed by [`crate::auth::password::PasswordService`]; this layer
+/// never sees plaintext passwords.
+#[derive(Debug, Clone)]
+pub struct NewUser {
+    pub username: String,
+    pub display_name: String,
+    pub password_hash: String,
+}
+
 #[async_trait]
 pub trait UserRepository: Send + Sync {
     async fn find_user_by_username(&self, username: &str) -> Result<Option<UserCredentialRecord>>;
+    async fn find_user_by_id(&self, user_id: Uuid) -> Result<Option<UserCredentialRecord>>;
+    async fn create_user(&self, user: &NewUser) -> Result<Uuid>;
+    /// Replace the stored password hash (admin reset path; the normal
+    /// password-change flow revokes sessions atomically and does not use
+    /// this method).
+    async fn update_password_hash(&self, user_id: Uuid, password_hash: &str) -> Result<()>;
+    async fn set_user_enabled(&self, user_id: Uuid, enabled: bool) -> Result<()>;
+    /// Role names currently assigned to the user. Read fresh on every
+    /// session validation so admin changes take effect immediately.
+    async fn user_role_names(&self, user_id: Uuid) -> Result<Vec<String>>;
 }

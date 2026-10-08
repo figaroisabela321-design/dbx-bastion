@@ -18,9 +18,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt"] }
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "sync"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 # Tests assert on sqlite_master directly through the same rusqlite version.
 rusqlite = { version = "0.32", features = ["bundled"] }

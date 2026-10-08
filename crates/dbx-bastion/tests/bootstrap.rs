@@ -57,6 +57,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "approval_requests",
     "assets",
     "audit_events",
+    "bootstrap_state",
     "execution_tickets",
     "permissions",
     "roles",
@@ -74,6 +75,7 @@ const EXPECTED_INDEXES: &[&str] = &[
     "idx_permissions_role_action",
     "idx_sessions_token",
     "idx_sessions_user",
+    "idx_sessions_user_active",
 ];
 
 #[tokio::test]
@@ -91,7 +93,7 @@ async fn fresh_init_creates_schema_and_records_version() {
     for expected in EXPECTED_INDEXES {
         assert!(indexes.iter().any(|i| i == expected), "missing index {expected}; have {indexes:?}");
     }
-    assert_eq!(applied_versions(&conn), vec!["0001_init".to_string()]);
+    assert_eq!(applied_versions(&conn), vec!["0001_init".to_string(), "0002_auth".to_string()]);
 
     let foreign_keys: i64 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0)).unwrap();
     assert_eq!(foreign_keys, 1, "foreign_keys pragma must be ON");
@@ -130,7 +132,7 @@ async fn migration_is_idempotent_and_preserves_data() {
     }
 
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(applied_versions(&conn).len(), 1, "migration version must not be recorded twice");
+    assert_eq!(applied_versions(&conn).len(), 2, "migration versions must not be recorded twice");
     drop(conn);
     cleanup(&path);
 }

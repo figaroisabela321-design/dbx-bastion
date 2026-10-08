@@ -20,4 +20,31 @@ pub enum BastionError {
 
     #[error("invalid data: {0}")]
     InvalidData(String),
+
+    /// Unified authentication failure. Returned for unknown user, wrong
+    /// password and disabled account alike so callers cannot distinguish
+    /// them (anti-enumeration).
+    #[error("authentication failed")]
+    AuthenticationFailed,
+
+    #[error("session is invalid or expired")]
+    InvalidSession,
+
+    #[error("too many login attempts; try again later")]
+    RateLimited,
+
+    #[error("admin bootstrap already completed")]
+    AlreadyBootstrapped,
+
+    #[error("password does not meet policy: {0}")]
+    WeakPassword(String),
+
+    #[error("password hashing error: {0}")]
+    PasswordHash(String),
+
+    #[error("secret file has insecure permissions: {0}")]
+    InsecureSecretFile(String),
+
+    #[error("bootstrap error: {0}")]
+    Bootstrap(String),
 }
