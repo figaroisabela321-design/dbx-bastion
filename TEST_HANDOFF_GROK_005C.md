@@ -172,3 +172,132 @@ DBX_PORT=8080 DBX_BIND_ADDR=127.0.0.1 \
   (见 `crates/dbx-bastion/src/auth/bootstrap.rs`)；测试环境需先 bootstrap。
 - **TASK-005D** 安全验收尚未开始；本轮目标是功能代码完成，
   不是宣称生产安全。
+
+---
+
+## 10. Grok Bot 全新环境交接补充
+
+### 10.1 Rust 工具链版本
+
+- `rustc 1.99.0`, `cargo 1.99.0` (dev 环境实测)
+- 安装: `rustup` stable channel; 需 `rustfmt` 组件 (`rustup component add rustfmt`)
+- `~/.cargo/bin` 需在 PATH
+
+### 10.2 Linux 系统依赖
+
+- `build-essential` (cc, ld) — rusqlite `bundled` 特性自带 SQLite，无需系统 libsqlite3
+- `pkg-config`
+- Git ≥ 2.30 (bundle 恢复用)
+- Ubuntu 22.04+ 实测可用
+
+### 10.3 测试所需环境变量 (完整表)
+
+```bash
+# 模式选择
+DBX_BASTION_MODE=1                  # 启用 bastion 模式 (必需)
+# DBX_BASTION_MODE=bogus           # 非法值 → 拒绝启动 (测试用)
+
+# 安全开关
+DBX_BASTION_SQL_EXECUTION_ENABLED=1 # 真实 SQL 执行总开关 (默认 false; E2E 开启)
+DBX_DISABLE_PASSWORD=1              # 与 BASTION_MODE=1 共存 → 拒绝启动 (测试用)
+
+# Cookie / TLS
+DBX_BASTION_ALLOW_INSECURE_COOKIE=1 # 仅非 TLS 开发测试允许非 Secure cookie
+
+# 网络
+DBX_DATA_DIR=/tmp/bastion-e2e       # 数据目录 (bastion 数据在 $DBX_DATA_DIR/bastion)
+DBX_PORT=8080
+DBX_BIND_ADDR=127.0.0.1
+DBX_PUBLIC_BASE_PATH=/dbx           # 可选; 非法值 → 启动错误 (测试用: /dbx/../evil)
+```
+
+### 10.4 测试数据库初始化
+
+**SQLite (资产映射目标示例):**
+```bash
+sqlite3 /tmp/bastion-e2e/test.db "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES(1,'a');"
+```
+然后在 DBX 中创建 connection (或直接往 `$DBX_DATA_DIR/dbx.db` 的 connections 表插入配置)，
+记下 `connection_id`，在 bastion 中创建 asset 并绑定该 `dbx_connection_id`。
+
+**MySQL / PostgreSQL:**
+- 准备空库 + 测试表 (与 SQLite 相同结构即可)
+- 在 DBX 中创建对应 connection，拿到 `connection_id`
+- 注意: 005C-3 仅放行 `mysql`/`postgres` 驱动；其他驱动执行会被明确拒绝 (fail-closed，有意为之)
+
+**DBX connection 配置来源:** bastion 模式启动时从 `$DBX_DATA_DIR/dbx.db`
+经 `Storage::load_connections()` 加载到内存 registry；`WebDbxConnectionAdapter`
+以此判断 `connection_exists`。
+
+### 10.5 管理员 Bootstrap 方法
+
+bastion 无默认管理员。首次使用需代码调用 (无 HTTP bootstrap 接口，有意为之):
+
+```rust
+use dbx_bastion::auth::{AdminBootstrap, BootstrapCredentials, BootstrapPolicy};
+use dbx_bastion::auth::PasswordService;
+
+let bootstrap = AdminBootstrap::new(store.clone(), PasswordService::default(), BootstrapPolicy::default());
+let admin_id = bootstrap.bootstrap(&BootstrapCredentials {
+    username: "ops-admin".into(),   // 禁止 admin/administrator/root/bastion 等弱组合
+    password: "<强密码>".into(),    // 需通过密码策略 (长度/复杂度)
+}).await?;
+```
+
+- bootstrap 只创建用户 + `bastion-admin` 角色成员关系，**不授予任何数据权限**
+- 之后用该用户名/密码调 `POST /api/bastion/auth/login` 拿 session
+- 资产授权 (grant) 需另行通过 `GrantService` 配置 (见 TASK-004)
+
+### 10.6 Bastion Mode 启动命令
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo build -p dbx-web -j 1   # 首次构建约 30-60 分钟 (低内存环境)
+
+DBX_BASTION_MODE=1 \
+DBX_DATA_DIR=/tmp/bastion-e2e \
+DBX_PORT=8080 DBX_BIND_ADDR=127.0.0.1 \
+./target/debug/dbx-web
+# 健康检查: curl http://127.0.0.1:8080/api/bastion/health
+# 状态检查: curl http://127.0.0.1:8080/api/bastion/status
+```
+
+### 10.7 运行防火墙测试命令
+
+```bash
+export CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+cargo test -p dbx-web --test bastion_firewall -j 1
+# 需要 ~6GB 峰值内存完成链接；16GB+ 机器推荐
+```
+
+### 10.8 全部测试命令
+
+```bash
+cargo fmt --check
+cargo check -p dbx-bastion -j 1
+cargo check -p dbx-web -j 1
+cargo check -p dbx-web --test bastion_firewall -j 1
+cargo test -p dbx-bastion -j 1              # 204/204 (dev 已通过)
+cargo test -p dbx-web --test bastion_firewall -j 1   # 20 项集成测试 (需高内存)
+# 注意: cargo clippy -p dbx-web --all-targets -- -D warnings 会因
+# dbx-driver-postgres 的 3 处旧 lint 失败 (与本轮无关)
+```
+
+### 10.9 已知的编译内存要求
+
+| 步骤 | 峰值 RSS | 说明 |
+|------|----------|------|
+| `cargo check -p dbx-web` | ~2.6 GB | `-j 1` 下通过 |
+| `cargo test` 链接 dbx-web 测试二进制 | **~6 GB** | 单 rustc 进程；7.7GB/0swap 环境 OOM |
+| 推荐 | ≥16 GB 或 8GB+swap | CI 环境 |
+
+### 10.10 敏感信息配置方式
+
+- **数据库密码/私钥:** 只存在于 DBX 的 `$DBX_DATA_DIR/dbx.db` connection 配置中，
+  由 DBX  legacy 存储加密管理；**bastion 库永不存储凭证**，`AssetView` DTO
+  按构造排除 `dbx_connection_id`
+- **Session token:** 原始 token 只经 `Set-Cookie` 返回一次；DB 只存 SHA-256
+- **管理员密码:** 经 `AdminBootstrap` 写入时即 Argon2 哈希，不落明文
+- **本仓库不含任何真实密码/token/私钥** (已扫描确认)
+- **不要**把测试用的弱密码提交到仓库；CI secrets 走环境变量
