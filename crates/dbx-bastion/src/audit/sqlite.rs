@@ -16,7 +16,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use uuid::Uuid;
 
-use super::{AuditEvent, AuditOutcome, AuditService};
+use super::{AuditEvent, AuditOutcome, AuditService, AuditStatus, UnfinishedAudit};
 use crate::error::{BastionError, Result};
 use crate::storage::SqliteStore;
 
@@ -89,6 +89,22 @@ pub struct SqliteAuditService {
 impl SqliteAuditService {
     pub fn new(store: Arc<SqliteStore>) -> Self {
         Self { store }
+    }
+
+    /// Count rows by status. Used by operators and integration tests to
+    /// verify that denials actually produced `blocked` rows (rather than
+    /// merely claiming to).
+    pub async fn count_by_status(&self, status: AuditStatus) -> Result<u64> {
+        let count: i64 = self
+            .store
+            .blocking(move |conn| {
+                conn.query_row("SELECT COUNT(*) FROM audit_events WHERE status = ?1", [status.as_str()], |row| {
+                    row.get(0)
+                })
+                .map_err(BastionError::from)
+            })
+            .await?;
+        Ok(count as u64)
     }
 }
 
@@ -176,18 +192,48 @@ impl AuditService for SqliteAuditService {
     }
 
     async fn has_untriaged_interruptions(&self) -> Result<bool> {
-        let count: i64 = self
-            .store
+        // Conservative direct-service check: any unfinished row counts.
+        // The gateway refines this with its in-flight set (see
+        // `list_unfinished`); concurrent queries in one process must not
+        // block each other.
+        Ok(!self.list_unfinished().await?.is_empty())
+    }
+
+    async fn list_unfinished(&self) -> Result<Vec<UnfinishedAudit>> {
+        self.store
             .blocking(|conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM audit_events WHERE status IN ('started', 'unknown_interrupted')",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(BastionError::from)
+                let mut stmt = conn.prepare(
+                    "SELECT id, status, started_at FROM audit_events
+                     WHERE status IN ('started', 'unknown_interrupted')
+                     ORDER BY started_at ASC",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let status: String = row.get(1)?;
+                    let started_at: String = row.get(2)?;
+                    let parse_err = |what: &'static str| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, what)),
+                        )
+                    };
+                    Ok(UnfinishedAudit {
+                        id: id.parse().map_err(|_| parse_err("bad audit id"))?,
+                        status: match status.as_str() {
+                            "started" => AuditStatus::Started,
+                            _ => AuditStatus::UnknownInterrupted,
+                        },
+                        started_at: started_at.parse().map_err(|_| parse_err("bad audit timestamp"))?,
+                    })
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
             })
-            .await?;
-        Ok(count > 0)
+            .await
     }
 }
 

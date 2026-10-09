@@ -24,6 +24,7 @@
 //! terminal state and the gateway enters fail-closed mode: it refuses new
 //! executions until an operator triages. It never claims a rollback.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,6 +69,12 @@ pub struct QueryGateway {
     /// after execution. The persistent `has_untriaged_interruptions`
     /// check covers restarts.
     fail_closed: AtomicBool,
+    /// Audit IDs this gateway instance started and has not finished.
+    /// A `started` row is only an interruption when it is NOT in this
+    /// set (orphaned by a crash/restart). V1 is single-process per
+    /// audit store; concurrent queries in one process never block
+    /// each other.
+    inflight: Mutex<HashSet<Uuid>>,
 }
 
 impl QueryGateway {
@@ -86,6 +93,7 @@ impl QueryGateway {
             clock,
             pre_execute_hook: Mutex::new(None),
             fail_closed: AtomicBool::new(false),
+            inflight: Mutex::new(HashSet::new()),
         }
     }
 
@@ -96,6 +104,35 @@ impl QueryGateway {
     /// sleeping. Never set in production code.
     pub fn set_pre_execute_hook(&self, hook: PreExecuteHook) {
         *self.pre_execute_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Step 0: refuse new executions when the audit trail shows
+    /// untriaged interruptions (crash recovery) or a previous audit
+    /// failure latched this gateway into fail-closed mode.
+    ///
+    /// `started` rows owned by this process (in [`Self::inflight`]) are
+    /// normal concurrency, not interruptions. After a restart the set
+    /// is empty, so surviving `started` rows are orphaned and refuse
+    /// new executions until triaged. `unknown_interrupted` rows always
+    /// count, regardless of ownership.
+    async fn fail_closed_check(&self) -> Result<()> {
+        if self.fail_closed.load(Ordering::SeqCst) {
+            return Err(BastionError::AuditFailClosed);
+        }
+        let unfinished = self
+            .audit
+            .list_unfinished()
+            .await
+            .map_err(|e| BastionError::AuditUnavailable(format!("audit unavailable: {e}")))?;
+        let inflight = self.inflight.lock().unwrap();
+        let interrupted =
+            unfinished.iter().any(|u| !matches!(u.status, AuditStatus::Started) || !inflight.contains(&u.id));
+        drop(inflight);
+        if interrupted {
+            self.fail_closed.store(true, Ordering::SeqCst);
+            return Err(BastionError::AuditFailClosed);
+        }
+        Ok(())
     }
 
     fn clamp_options(options: &ExecutionOptions) -> ExecutionOptions {
@@ -206,10 +243,20 @@ impl QueryGateway {
     }
 
     pub async fn execute(&self, principal: &AuthenticatedPrincipal, req: GatewayRequest) -> Result<QueryResultDto> {
-        // 0. Fail-closed mode: untriaged interruptions refuse everything.
-        if self.fail_closed.load(Ordering::SeqCst) || self.audit.has_untriaged_interruptions().await? {
-            return Err(BastionError::AuditFailClosed);
-        }
+        self.execute_with_cancel(principal, req, CancellationToken::new()).await
+    }
+
+    /// Execute with a caller-supplied parent cancellation token (e.g.
+    /// the HTTP layer cancels it when the client disconnects). The
+    /// executor receives a child token so gateway-internal timeouts
+    /// and caller cancellation are independent triggers.
+    pub async fn execute_with_cancel(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        req: GatewayRequest,
+        parent_cancel: CancellationToken,
+    ) -> Result<QueryResultDto> {
+        self.fail_closed_check().await?;
 
         let options = Self::clamp_options(&req.options);
         let hash = sql_hash(&req.sql);
@@ -320,28 +367,54 @@ impl QueryGateway {
             sql.clone(),
             &options,
         );
-        // 12. Execute with cancellation + timeout.
-        let cancel = CancellationToken::new();
+        // 12. Execute with cancellation + timeout. The child token lets
+        //     the caller cancel independently of the gateway timeout.
+        let cancel = parent_cancel.child_token();
         let started = Instant::now();
         let exec_result = tokio::time::timeout(options.timeout, self.executor.execute(&ctx, cancel.clone())).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
         match exec_result {
             Err(_) => {
-                // Timeout: cancel the backend work, then audit.
+                // Timeout WITHOUT a confirmed outcome: the database may
+                // still be running the statement, it may have completed,
+                // or the cancel may land later. We must not record this
+                // as a plain failure — the outcome is unknown.
+                // Audit `unknown_interrupted` and enter fail-closed mode;
+                // the connection must be isolated (never reused) by the
+                // real adapter, and an operator triages the record.
                 cancel.cancel();
+                let outcome = AuditOutcome {
+                    status: AuditStatus::UnknownInterrupted,
+                    success: None,
+                    row_count: None,
+                    duration_ms: Some(elapsed_ms as i64),
+                    error_message: Some(
+                        "execution timed out without a confirmed outcome; the statement may still be running"
+                            .to_string(),
+                    ),
+                };
+                self.finish_audit(audit_id, outcome).await?;
+                // The outcome is unknown: refuse new executions until an
+                // operator triages the `unknown_interrupted` record.
+                // (The untriaged-interruptions check would also refuse on
+                // the next call; latching immediately closes the gap.)
+                self.fail_closed.store(true, Ordering::SeqCst);
+                Err(BastionError::ExecutionTimeout)
+            }
+            Ok(Err(BastionError::ExecutionCancelled)) => {
+                // The executor CONFIRMED the statement was cancelled
+                // before completing: it had no effect. This is a clean
+                // failure, not an unknown outcome — no fail-closed.
                 let outcome = AuditOutcome {
                     status: AuditStatus::Failed,
                     success: Some(false),
                     row_count: None,
                     duration_ms: Some(elapsed_ms as i64),
-                    error_message: Some("execution timed out".to_string()),
+                    error_message: Some("execution cancelled before completion".to_string()),
                 };
-                if self.audit.record_finished(audit_id, outcome).await.is_err() {
-                    self.fail_closed.store(true, Ordering::SeqCst);
-                    return Err(BastionError::AuditFailClosed);
-                }
-                Err(BastionError::ExecutionTimeout)
+                self.finish_audit(audit_id, outcome).await?;
+                Err(BastionError::ExecutionCancelled)
             }
             Ok(Err(e)) => {
                 let outcome = AuditOutcome {
@@ -351,10 +424,7 @@ impl QueryGateway {
                     duration_ms: Some(elapsed_ms as i64),
                     error_message: Some(e.to_string()),
                 };
-                if self.audit.record_finished(audit_id, outcome).await.is_err() {
-                    self.fail_closed.store(true, Ordering::SeqCst);
-                    return Err(BastionError::AuditFailClosed);
-                }
+                self.finish_audit(audit_id, outcome).await?;
                 Err(e)
             }
             Ok(Ok(mut dto)) => {
@@ -366,14 +436,23 @@ impl QueryGateway {
                     duration_ms: Some(elapsed_ms as i64),
                     error_message: None,
                 };
-                if self.audit.record_finished(audit_id, outcome).await.is_err() {
-                    // Executed but unrecorded: enter fail-closed mode.
-                    // Never claim a rollback.
-                    self.fail_closed.store(true, Ordering::SeqCst);
-                    return Err(BastionError::AuditFailClosed);
-                }
+                self.finish_audit(audit_id, outcome).await?;
                 Ok(dto)
             }
         }
+    }
+
+    /// Record a terminal audit outcome and release the in-flight
+    /// registration. A failed write latches fail-closed: an executed
+    /// statement with no audit record is the worst outcome, and we
+    /// never claim the database operation was rolled back.
+    async fn finish_audit(&self, audit_id: Uuid, outcome: AuditOutcome) -> Result<()> {
+        let write_failed = self.audit.record_finished(audit_id, outcome).await.is_err();
+        self.inflight.lock().unwrap().remove(&audit_id);
+        if write_failed {
+            self.fail_closed.store(true, Ordering::SeqCst);
+            return Err(BastionError::AuditFailClosed);
+        }
+        Ok(())
     }
 }

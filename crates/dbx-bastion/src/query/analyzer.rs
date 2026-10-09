@@ -252,8 +252,9 @@ impl<'a> QueryWalker<'a> {
     ///
     /// V1 identity rules: MySQL has no schema level (`NotApplicable` is
     /// legitimate there; the database is the connection default, else
-    /// `Unknown`). SQLite resolves unqualified names to `main`
-    /// (`temp`/attached databases require 2-part qualification). On
+    /// `Unknown`). SQLite bare names are `Unknown` (temp/main/attached
+    /// resolution order is unknowable statically); explicit
+    /// `main.`/`temp.`/`<attached>.` qualification is required. On
     /// PostgreSQL, SQL Server and Generic an unqualified schema is
     /// `Unknown`, because `search_path` (PG) and per-user default
     /// schemas (SQL Server) cannot be determined statically.
@@ -269,7 +270,11 @@ impl<'a> QueryWalker<'a> {
             [table] => {
                 let (database, schema) = match self.ctx.dialect {
                     SqlDialect::MySql => (self.db_or_unknown(), NameState::NotApplicable),
-                    SqlDialect::Sqlite => (NameState::present("main"), NameState::NotApplicable),
+                    // SQLite resolves bare names via temp -> main -> attached
+                    // order, which is unknowable statically: a `temp.orders`
+                    // table shadows `main.orders`. V1 requires explicit
+                    // `main.`/`temp.` qualification.
+                    SqlDialect::Sqlite => (NameState::Unknown, NameState::NotApplicable),
                     _ => (self.db_or_unknown(), NameState::Unknown),
                 };
                 Ok(TableRef { database, schema, table: table.clone() })
@@ -310,16 +315,18 @@ impl<'a> QueryWalker<'a> {
     }
 
     /// A function call is proven side-effect-free iff the name is on the
-    /// pure allowlist **and** its identity is proven:
-    /// - unqualified (`now()`), or
-    /// - qualified by a known system schema (`pg_catalog.now()`).
+    /// pure allowlist **and** its identity is proven.
     ///
-    /// A user-schema qualification (`myschema.now()`) is *not* proven:
-    /// it may resolve to a UDF shadowing a builtin name, so it is
-    /// treated as having side effects (policy denies). Unqualified
-    /// names still depend on `search_path`; planting a shadowing UDF
-    /// requires DDL, which the gateway denies, so the residual risk is
-    /// documented rather than blocking all unqualified calls in V1.
+    /// PostgreSQL (V1 strict): only an explicit `pg_catalog.<pure>`
+    /// qualification is proven. Unqualified names depend on
+    /// `search_path` and are subject to UDF shadowing, overloading and
+    /// type-resolution ambiguity; they are treated as having side
+    /// effects (policy denies). Any other qualification
+    /// (`myschema.now()`) may resolve to a shadowing UDF and is denied.
+    ///
+    /// Other dialects: unqualified pure names are allowed (no
+    /// `search_path` equivalent), as is `pg_catalog.`/`sys.`
+    /// qualification; anything else is denied.
     fn is_proven_pure(&self, name: &ObjectName) -> Result<bool, AnalyzeError> {
         let parts: Vec<String> =
             name.0.iter().map(|p| Self::part_ident(p).map(|i| self.canonical(i))).collect::<Result<_, _>>()?;
@@ -331,12 +338,19 @@ impl<'a> QueryWalker<'a> {
         if !is_pure_function(&func.to_uppercase()) {
             return Ok(false);
         }
-        if qualifiers.is_empty() {
-            return Ok(true);
+        let is_system = |q: &String| matches!(q.to_lowercase().as_str(), "pg_catalog" | "sys");
+        match self.ctx.dialect {
+            SqlDialect::Postgres => {
+                // Exactly `pg_catalog.<pure>`: proven builtin identity.
+                Ok(qualifiers.len() == 1 && is_system(&qualifiers[0]))
+            }
+            _ => {
+                if qualifiers.is_empty() {
+                    return Ok(true);
+                }
+                Ok(qualifiers.iter().all(is_system))
+            }
         }
-        // Every qualifier must be a known system schema; anything else
-        // could be a user schema with a shadowing UDF.
-        Ok(qualifiers.iter().all(|q| matches!(q.to_lowercase().as_str(), "pg_catalog" | "sys")))
     }
 
     fn check_function(&mut self, func: &Function) -> Result<(), AnalyzeError> {

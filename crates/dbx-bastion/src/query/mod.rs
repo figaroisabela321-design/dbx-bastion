@@ -30,7 +30,7 @@ pub use analyzer::{
     AnalyzeError, AnalyzeRequest, AnalyzedStatement, SqlAnalyzer, SqlDialect, StatementAction, TableRef,
 };
 pub use gateway::QueryGateway;
-pub use mock::MockExecutor;
+pub use mock::{MockBehavior, MockExecutor};
 pub use policy::{PolicyContext, PolicyDecision, PolicyReason, SqlPolicy};
 
 use std::time::Duration;

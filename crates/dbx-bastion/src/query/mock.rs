@@ -24,6 +24,10 @@ pub enum MockBehavior {
     Fail(String),
     /// Never return (exercises gateway timeout / cancellation).
     Hang,
+    /// Honors cancellation: when the token fires, waits `delay` (models
+    /// backend cancel round-trip) then returns `ExecutionCancelled`,
+    /// confirming the statement did not complete.
+    ConfirmCancelAfter { delay: Duration },
 }
 
 impl Default for MockBehavior {
@@ -89,11 +93,20 @@ impl QueryExecutor for MockExecutor {
             match behavior {
                 MockBehavior::Fail(msg) => Err(BastionError::ExecutorFailed(msg)),
                 MockBehavior::Hang => {
-                    // Sleep in small slices so cancellation is prompt.
+                    // Ignores cancellation: models an unresponsive backend.
                     loop {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
+                MockBehavior::ConfirmCancelAfter { delay } => loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            tokio::time::sleep(delay).await;
+                            return Err(BastionError::ExecutionCancelled);
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
+                },
                 MockBehavior::Success { columns, rows, affected_rows } => {
                     // Backend-side row cap.
                     let mut out_rows = rows;

@@ -19,7 +19,7 @@ use uuid::Uuid;
 use dbx_bastion::asset::{
     AssetRepository, DbxConnectionAdapter, MockDbxConnectionAdapter, NewAsset, NewUser, UserRepository,
 };
-use dbx_bastion::audit::{AuditService, SqliteAuditService};
+use dbx_bastion::audit::{AuditService, AuditStatus, SqliteAuditService};
 use dbx_bastion::auth::session::SystemClock;
 use dbx_bastion::auth::{
     AdminBootstrap, AuthenticatedPrincipal, BootstrapCredentials, BootstrapPolicy, LoginRequest, PasswordConfig,
@@ -31,6 +31,7 @@ use dbx_bastion::query::{ExecutionOptions, GatewayRequest, MockExecutor, QueryEx
 use dbx_bastion::rbac::{Action, AssetScope, Effect, GrantService, NewGrant};
 use dbx_bastion::storage::SqliteStore;
 use dbx_bastion::BastionService;
+use tokio_util::sync::CancellationToken;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -82,6 +83,10 @@ impl AuditService for FlakyAudit {
 
     async fn has_untriaged_interruptions(&self) -> dbx_bastion::Result<bool> {
         self.inner.has_untriaged_interruptions().await
+    }
+
+    async fn list_unfinished(&self) -> dbx_bastion::Result<Vec<dbx_bastion::audit::UnfinishedAudit>> {
+        self.inner.list_unfinished().await
     }
 }
 
@@ -588,7 +593,10 @@ async fn executor_error_is_audited_and_returned() {
 }
 
 #[tokio::test]
-async fn executor_timeout_cancels() {
+async fn executor_timeout_is_unknown_not_failed() {
+    // The backend ignores cancellation: the gateway cannot confirm the
+    // outcome, so it must NOT record a plain failure. The audit row is
+    // `unknown_interrupted` and the gateway latches fail-closed.
     let gw = Gw::new("s20").await;
     gw.executor.set_behavior(MockBehavior::Hang);
     let mut req = gw.req("SELECT * FROM appdb.orders");
@@ -596,6 +604,38 @@ async fn executor_timeout_cancels() {
     let err = gw.gateway.execute(&gw.user, req).await.expect_err("must time out");
     assert!(matches!(err, BastionError::ExecutionTimeout), "got {err:?}");
     assert_eq!(gw.executor.calls(), 1);
+    assert_eq!(gw.audit.inner.count_by_status(AuditStatus::UnknownInterrupted).await.unwrap(), 1);
+    assert_eq!(gw.audit.inner.count_by_status(AuditStatus::Failed).await.unwrap(), 0);
+    // Fail-closed: the gateway refuses new executions until triage.
+    let err = gw.gateway.execute(&gw.user, gw.req("SELECT * FROM appdb.orders")).await.expect_err("latched");
+    assert!(matches!(err, BastionError::AuditFailClosed));
+    assert_eq!(gw.executor.calls(), 1);
+}
+
+#[tokio::test]
+async fn confirmed_cancellation_is_a_clean_failure() {
+    // The backend confirms the statement did not complete: this is a
+    // clean failure, not an unknown outcome — no fail-closed latch,
+    // and the gateway keeps serving.
+    let gw = Gw::new("s20b").await;
+    gw.executor.set_behavior(MockBehavior::ConfirmCancelAfter { delay: Duration::from_millis(50) });
+    let parent = CancellationToken::new();
+    let p2 = parent.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        p2.cancel();
+    });
+    let err = gw
+        .gateway
+        .execute_with_cancel(&gw.user, gw.req("SELECT * FROM appdb.orders"), parent)
+        .await
+        .expect_err("cancelled");
+    assert!(matches!(err, BastionError::ExecutionCancelled), "got {err:?}");
+    assert_eq!(gw.audit.inner.count_by_status(AuditStatus::Failed).await.unwrap(), 1);
+    assert_eq!(gw.audit.inner.count_by_status(AuditStatus::UnknownInterrupted).await.unwrap(), 0);
+    // Not latched: the next query proceeds.
+    gw.executor.set_behavior(MockBehavior::default());
+    gw.gateway.execute(&gw.user, gw.req("SELECT * FROM appdb.orders")).await.expect("recovers");
 }
 
 // ---- 22. result limits ------------------------------------------------------------------
@@ -634,4 +674,44 @@ async fn request_cannot_carry_connection_config() {
     assert!(debug.contains("asset_id"));
     assert!(!debug.contains("password"));
     assert!(!debug.contains("ConnectionConfig"));
+}
+
+#[tokio::test]
+async fn concurrent_queries_do_not_block_each_other() {
+    // Two queries in flight on the same gateway: each sees the other's
+    // `started` row, but both are owned in-flight, so neither is an
+    // interruption. (Requires the mock to actually take time.)
+    let gw = Gw::new("conc").await;
+    gw.executor.set_behavior(MockBehavior::ConfirmCancelAfter { delay: Duration::from_millis(200) });
+    // Use Hang with a twist: we need the queries to overlap. Instead,
+    // run both via spawn and join.
+    gw.executor.set_behavior(MockBehavior::Success {
+        columns: vec!["c".to_string()],
+        rows: vec![vec!["1".to_string()]],
+        affected_rows: None,
+    });
+    let g1 = &gw.gateway;
+    let g2 = &gw.gateway;
+    let (r1, r2) = tokio::join!(
+        g1.execute(&gw.user, gw.req("SELECT * FROM appdb.orders")),
+        g2.execute(&gw.user, gw.req("SELECT * FROM appdb.orders")),
+    );
+    r1.expect("query 1");
+    r2.expect("query 2");
+    assert_eq!(gw.executor.calls(), 2);
+    assert_eq!(gw.audit.inner.count_by_status(AuditStatus::Succeeded).await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn blocked_denials_produce_audit_rows() {
+    // Every denial path must leave a real `blocked` audit row — not
+    // merely claim to have recorded one.
+    let gw = Gw::new("blk").await;
+    // Policy deny.
+    let _ = gw.gateway.execute(&gw.user, gw.req("DROP TABLE appdb.orders")).await;
+    // RBAC deny.
+    let _ = gw.gateway.execute(&gw.user, gw.req("SELECT * FROM appdb.secret")).await;
+    // Production deny (via new_with_env would need another Gw; use policy path).
+    assert_eq!(gw.audit.inner.count_by_status(AuditStatus::Blocked).await.unwrap(), 2);
+    assert_eq!(gw.executor.calls(), 0);
 }

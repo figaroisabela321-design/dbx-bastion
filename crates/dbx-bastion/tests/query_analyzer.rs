@@ -340,11 +340,19 @@ fn sqlite_has_no_schema_level() {
     let s = one("SELECT * FROM main.orders", SqlDialect::Sqlite);
     // SQLite: two parts are database.table (attached-database name).
     assert_eq!(tables(&s.sources), vec![(p("main"), na(), "orders".to_string())]);
-    // Bare tables resolve to `main`, never a guess.
-    let s = one("SELECT * FROM orders", SqlDialect::Sqlite);
-    assert_eq!(tables(&s.sources), vec![(p("main"), na(), "orders".to_string())]);
     let s = one("SELECT * FROM temp.orders", SqlDialect::Sqlite);
     assert_eq!(tables(&s.sources), vec![(p("temp"), na(), "orders".to_string())]);
+}
+
+#[test]
+fn sqlite_bare_table_is_unknown() {
+    // temp -> main resolution order is unknowable statically: a
+    // `temp.orders` table would shadow `main.orders`. V1 requires
+    // explicit qualification; the bare name resolves to Unknown and
+    // the policy denies it before RBAC.
+    let s = one("SELECT * FROM orders", SqlDialect::Sqlite);
+    assert_eq!(s.sources[0].database, NameState::Unknown);
+    assert!(s.sources[0].has_unknown_level());
 }
 
 // ---- 14. side-effect SELECTs -------------------------------------------------------
@@ -551,4 +559,53 @@ fn analysis_latency_baseline() {
         println!("analyze[{name}]: {elapsed:?}");
         assert!(elapsed.as_secs() < 1, "analyze[{name}] took {elapsed:?}, investigate");
     }
+}
+
+#[test]
+fn pg_requires_pg_catalog_qualification() {
+    // V1 (strict): on PostgreSQL only an explicit `pg_catalog.<pure>`
+    // call is proven side-effect-free.
+    let s = one("SELECT pg_catalog.now()", SqlDialect::Postgres);
+    assert!(!s.has_side_effects);
+    let s = one("SELECT pg_catalog.count(*) FROM public.orders", SqlDialect::Postgres);
+    assert!(!s.has_side_effects);
+    // Unqualified: search_path / UDF shadowing / overload ambiguity.
+    let s = one("SELECT now()", SqlDialect::Postgres);
+    assert!(s.has_side_effects);
+    let s = one("SELECT count(*) FROM public.orders", SqlDialect::Postgres);
+    assert!(s.has_side_effects);
+    // User-schema qualification: proven shadowing risk.
+    let s = one("SELECT public.now()", SqlDialect::Postgres);
+    assert!(s.has_side_effects);
+    let s = one("SELECT myschema.coalesce(a, b) FROM public.t", SqlDialect::Postgres);
+    assert!(s.has_side_effects);
+}
+
+#[test]
+fn pg_function_overload_ambiguity_is_denied_unqualified() {
+    // `round` is overloaded in PG (round(numeric), round(numeric,int));
+    // an unqualified call cannot prove which implementation runs, and a
+    // UDF could shadow the name via search_path.
+    let s = one("SELECT round(price) FROM public.t", SqlDialect::Postgres);
+    assert!(s.has_side_effects);
+    let s = one("SELECT round(price, 2) FROM public.t", SqlDialect::Postgres);
+    assert!(s.has_side_effects);
+    // Explicit pg_catalog qualification pins the builtin identity.
+    let s = one("SELECT pg_catalog.round(price) FROM public.t", SqlDialect::Postgres);
+    assert!(!s.has_side_effects);
+    // `substr(...)` parses as Expr::Substring (builtin syntax, not a
+    // function call); it is pure on all dialects.
+    let s = one("SELECT substr(name, 1, 3) FROM public.t", SqlDialect::Postgres);
+    assert!(!s.has_side_effects);
+}
+
+#[test]
+fn non_pg_dialects_keep_unqualified_pure_calls() {
+    // MySQL / SQL Server have no search_path equivalent for builtins.
+    let s = one("SELECT NOW()", SqlDialect::MySql);
+    assert!(!s.has_side_effects);
+    let s = one("SELECT now()", SqlDialect::SqlServer);
+    assert!(!s.has_side_effects);
+    let s = one("SELECT sys.now()", SqlDialect::SqlServer);
+    assert!(!s.has_side_effects);
 }

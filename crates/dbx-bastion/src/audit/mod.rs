@@ -16,6 +16,17 @@
 //!   enters a mode that refuses new executions until an operator
 //!   triages the record.
 //!
+//! Concurrency model (V1: single gateway process per audit store):
+//! - A `started` row is **not** an interruption while its owning
+//!   gateway process is alive: the gateway tracks its in-flight audit
+//!   IDs in memory and excludes them when checking for interruptions.
+//!   Concurrent queries in the same process never block each other.
+//! - After a restart the in-memory set is empty, so any surviving
+//!   `started` row is an orphaned interruption and refuses new
+//!   executions until triaged.
+//! - `unknown_interrupted` rows always count as interruptions,
+//!   regardless of ownership.
+//!
 //! Evidence rules:
 //! - SQL text is stored (forensics need it); result **rows are never
 //!   stored**, only counts/hashes/truncation markers.
@@ -113,6 +124,14 @@ pub struct AuditOutcome {
 }
 
 /// Audit service contract (implemented in TASK-005B).
+/// A non-terminal audit row, for interruption triage.
+#[derive(Debug, Clone)]
+pub struct UnfinishedAudit {
+    pub id: Uuid,
+    pub status: AuditStatus,
+    pub started_at: DateTime<Utc>,
+}
+
 #[async_trait::async_trait]
 pub trait AuditService: Send + Sync {
     /// Append a `Started` record. `Err` means the audit store is
@@ -126,4 +145,11 @@ pub trait AuditService: Send + Sync {
     /// True while an `UnknownInterrupted` record is untriaged: the
     /// gateway refuses new executions.
     async fn has_untriaged_interruptions(&self) -> Result<bool>;
+
+    /// All rows without a terminal state (`started` or
+    /// `unknown_interrupted`), oldest first. The gateway uses this to
+    /// distinguish its own in-flight executions (tracked in memory)
+    /// from orphaned rows left by a crashed process: only the latter
+    /// count as interruptions.
+    async fn list_unfinished(&self) -> Result<Vec<UnfinishedAudit>>;
 }
