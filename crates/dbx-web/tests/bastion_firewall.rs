@@ -360,10 +360,21 @@ async fn untriaged_audit_starts_degraded() {
     assert_eq!(status["startup_state"], "degraded");
     assert_eq!(status["execution_refused"], true);
 
+    // Execution gate: login requires Origin (CSRF). Without it,
+    // the request must be rejected with 403 — CSRF is not relaxed.
+    let no_origin_resp = client
+        .post(format!("http://127.0.0.1:{port}/api/bastion/auth/login"))
+        .json(&serde_json::json!({"username": username, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_origin_resp.status(), 403, "login without Origin must be rejected (CSRF)");
+
     // Execution gate: login, then query/execute must return 503
     // (DEGRADED refusal), not execute. The audit record is kept.
     let login_resp = client
         .post(format!("http://127.0.0.1:{port}/api/bastion/auth/login"))
+        .header("Origin", format!("http://127.0.0.1:{port}"))
         .json(&serde_json::json!({"username": username, "password": password}))
         .send()
         .await

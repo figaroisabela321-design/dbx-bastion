@@ -61,14 +61,25 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 
 /// Validate and normalize `DBX_PUBLIC_BASE_PATH` for bastion mode.
 ///
-/// Returns the normalized base path (`/` when unset/empty) or a
-/// diagnosable startup configuration error (no panic). Rejects:
-/// - values not starting with `/`,
-/// - path traversal (`.` / `..` segments),
-/// - empty segments (`//`),
-/// - percent-encoded sequences (the value must already be normalized),
-/// - control characters, whitespace, and `; , ? # % \`.
-/// A single trailing slash is normalized away (`/dbx/` → `/dbx`).
+/// Order (fail-closed):
+/// 1. Identify the root path `/` (and unset/empty) first.
+/// 2. For non-root paths, strip at most ONE legal trailing slash
+///    (`/dbx/` → `/dbx`). A second trailing slash (`/dbx//`) is left
+///    in place so the empty-segment check below rejects it.
+/// 3. Validate internal empty segments (`//`), path traversal
+///    (`.` / `..` segments), and illegal characters.
+/// 4. Return the normalized path.
+///
+/// Illegal values return a diagnosable startup configuration error
+/// (no panic). Rejects values not starting with `/`.
+///
+/// Guarantees:
+/// - `/dbx` → `/dbx`
+/// - `/dbx/` → `/dbx`
+/// - `/dbx//` → rejected (empty segment)
+/// - `/dbx//api` → rejected (empty segment)
+/// - `/dbx/../evil` → rejected (traversal)
+/// - `/dbx%2fapi` → rejected (percent-encoded)
 pub fn validate_base_path(value: Option<&str>) -> Result<String, String> {
     let raw = value.unwrap_or("").trim();
     if raw.is_empty() || raw == "/" {
@@ -77,7 +88,13 @@ pub fn validate_base_path(value: Option<&str>) -> Result<String, String> {
     if !raw.starts_with('/') {
         return Err(format!("invalid DBX_PUBLIC_BASE_PATH {raw:?}: must start with '/' or be empty"));
     }
-    if raw
+    // Step 2: strip at most one trailing slash for non-root paths.
+    let mut path = raw;
+    if path.len() > 1 && path.ends_with('/') {
+        path = &path[..path.len() - 1];
+    }
+    // Step 3: validate characters, then segments.
+    if path
         .chars()
         .any(|ch| ch.is_ascii_control() || ch.is_ascii_whitespace() || matches!(ch, ';' | ',' | '?' | '#' | '%' | '\\'))
     {
@@ -86,7 +103,7 @@ pub fn validate_base_path(value: Option<&str>) -> Result<String, String> {
              in a URL path prefix"
         ));
     }
-    for seg in raw.split('/').skip(1) {
+    for seg in path.split('/').skip(1) {
         if seg.is_empty() {
             return Err(format!("invalid DBX_PUBLIC_BASE_PATH {raw:?}: empty path segment ('//')"));
         }
@@ -94,11 +111,7 @@ pub fn validate_base_path(value: Option<&str>) -> Result<String, String> {
             return Err(format!("invalid DBX_PUBLIC_BASE_PATH {raw:?}: path traversal segment {seg:?} is not allowed"));
         }
     }
-    let mut normalized = raw.to_string();
-    while normalized.len() > 1 && normalized.ends_with('/') {
-        normalized.pop();
-    }
-    Ok(normalized)
+    Ok(path.to_string())
 }
 
 /// Normalize a request path for whitelist comparison.
@@ -298,6 +311,27 @@ mod tests {
         assert!(validate_base_path(Some("/dbx#frag")).is_err());
         assert!(validate_base_path(Some("/db x")).is_err()); // whitespace
         assert!(validate_base_path(Some("/dbx\\api")).is_err()); // backslash
+    }
+
+    #[test]
+    fn base_path_trailing_slash_order() {
+        // Trailing slash is stripped BEFORE the empty-segment check:
+        // /dbx/ must normalize, not be rejected.
+        assert_eq!(validate_base_path(Some("/dbx/")).unwrap(), "/dbx");
+        assert_eq!(validate_base_path(Some("/dbx")).unwrap(), "/dbx");
+        // Multi-level base with trailing slash.
+        assert_eq!(validate_base_path(Some("/dbx/v2/")).unwrap(), "/dbx/v2");
+        // Double trailing slash: only one is stripped, the remaining
+        // empty segment is rejected.
+        assert!(validate_base_path(Some("/dbx//")).is_err());
+        // Internal empty segments are still rejected.
+        assert!(validate_base_path(Some("/dbx//api")).is_err());
+        // Traversal and encoded sequences are still rejected.
+        assert!(validate_base_path(Some("/dbx/../evil")).is_err());
+        assert!(validate_base_path(Some("/dbx%2fapi")).is_err());
+        // Root and empty stay root.
+        assert_eq!(validate_base_path(Some("/")).unwrap(), "/");
+        assert_eq!(validate_base_path(None).unwrap(), "/");
     }
 
     #[test]
