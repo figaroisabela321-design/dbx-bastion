@@ -101,18 +101,28 @@ pub fn validate_base_path(value: Option<&str>) -> Result<String, String> {
     Ok(normalized)
 }
 
-/// Normalize a request path for whitelist comparison:
-/// - require the path to be under the configured public base path on
-///   a segment boundary (no fuzzy prefix matching: `/dbx` does not
-///   match `/dbxevil/...`),
-/// - percent-decode,
-/// - reject `..` segments after decoding (encoded traversal),
-/// - drop a trailing slash (except for `/` itself).
+/// Normalize a request path for whitelist comparison.
+///
+/// Order matters (fail-closed):
+/// 1. Strip a single legal trailing slash on the raw path
+///    (`/dbx/` → `/dbx`) BEFORE base-path matching, so the
+///    segment-boundary check sees a canonical form.
+/// 2. Require the path to be under the configured public base path
+///    on a segment boundary (no fuzzy prefix matching: `/dbx` does
+///    not match `/dbxevil/...`).
+/// 3. Percent-decode.
+/// 4. Reject `..` segments after decoding (encoded traversal).
+/// 5. Drop a trailing slash on the stripped path (except `/`).
 ///
 /// Anything suspicious normalizes to `""`, which never matches the
 /// whitelist (fail-closed).
 fn normalize_path(raw: &str, base_path: &str) -> String {
     let mut path = raw;
+    // Step 1: legal trailing slash first.
+    if path.len() > 1 && path.ends_with('/') {
+        path = &path[..path.len() - 1];
+    }
+    // Step 2: base-path segment-boundary check.
     if base_path != "/" {
         // Strict segment-boundary match.
         let under_base = path == base_path || path.starts_with(&format!("{base_path}/"));
@@ -125,13 +135,14 @@ fn normalize_path(raw: &str, base_path: &str) -> String {
             path = "/";
         }
     }
-    // Percent-decode (best effort; invalid sequences stay as-is and
-    // will simply not match the whitelist).
+    // Step 3: percent-decode (best effort; invalid sequences stay
+    // as-is and will simply not match the whitelist).
     let decoded = percent_decode(path);
-    // Encoded traversal (`%2e%2e`, `..%2f`, …) is rejected outright.
+    // Step 4: encoded traversal (`%2e%2e`, `..%2f`, …) is rejected.
     if decoded.split('/').any(|seg| seg == "..") {
         return String::new();
     }
+    // Step 5: trailing slash on the stripped path.
     let mut normalized = decoded;
     if normalized.len() > 1 && normalized.ends_with('/') {
         normalized.pop();
@@ -287,5 +298,31 @@ mod tests {
         assert!(validate_base_path(Some("/dbx#frag")).is_err());
         assert!(validate_base_path(Some("/db x")).is_err()); // whitespace
         assert!(validate_base_path(Some("/dbx\\api")).is_err()); // backslash
+    }
+
+    #[test]
+    fn normalize_path_trailing_slash_first() {
+        // Legal trailing slash on the base path is normalized before
+        // the segment-boundary check: /dbx/ -> /dbx.
+        assert_eq!(normalize_path("/dbx/", "/dbx"), "/");
+        assert_eq!(normalize_path("/dbx", "/dbx"), "/");
+        // Whitelisted route under /dbx with trailing slash.
+        assert_eq!(normalize_path("/dbx/api/bastion/health/", "/dbx"), "/api/bastion/health");
+        assert_eq!(normalize_path("/dbx/api/bastion/health", "/dbx"), "/api/bastion/health");
+        // Double slash inside the path stays suspicious (never matches).
+        assert_eq!(normalize_path("/dbx//api", "/dbx"), "//api");
+        assert!(!is_allowed(&Method::GET, &normalize_path("/dbx//api", "/dbx")));
+        // Traversal after base strip is rejected.
+        assert_eq!(normalize_path("/dbx/../evil", "/dbx"), "");
+        assert_eq!(normalize_path("/dbx/api/%2e%2e/bastion/health", "/dbx"), "");
+        // Encoded slash does not create a segment boundary.
+        assert_eq!(normalize_path("/dbx%2fapi", "/dbx"), "");
+        // No leading slash: rejected.
+        assert_eq!(normalize_path("dbx", "/dbx"), "");
+        // Fuzzy prefix: rejected.
+        assert_eq!(normalize_path("/dbxevil/api/bastion/health", "/dbx"), "");
+        // Root base path: trailing slash handled on the route itself.
+        assert_eq!(normalize_path("/api/bastion/health/", "/"), "/api/bastion/health");
+        assert_eq!(normalize_path("/", "/"), "/");
     }
 }

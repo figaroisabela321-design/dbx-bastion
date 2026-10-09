@@ -78,33 +78,59 @@ impl Server {
 }
 
 /// Seed an untriaged `started` audit row directly in the bastion DB.
-fn seed_untriaged_started(data_dir: &std::path::Path) {
+/// Async: uses the caller's Tokio runtime (never creates a new one).
+async fn seed_untriaged_started(data_dir: &std::path::Path) {
     let service = BastionService::open(data_dir.join("bastion").join("bastion.db")).unwrap();
     let audit = SqliteAuditService::new(service.store().clone());
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(audit.record_started(AuditEvent {
-        id: uuid::Uuid::new_v4(),
-        user_id: uuid::Uuid::new_v4(),
-        session_id: uuid::Uuid::new_v4(),
-        asset_id: uuid::Uuid::new_v4(),
-        database: None,
-        schema: None,
-        sql_text: "SELECT 1".to_string(),
-        sql_hash: "00".to_string(),
-        action: StatementAction::Select,
-        risk_level: dbx_bastion::policy::RiskLevel::Low,
-        policy_decision: None,
-        source_ip: None,
-        client_request_id: None,
-        status: AuditStatus::Started,
-        success: None,
-        row_count: None,
-        duration_ms: None,
-        error_message: None,
-        started_at: chrono::Utc::now(),
-        finished_at: None,
-    }))
-    .unwrap();
+    audit
+        .record_started(AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            user_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            asset_id: uuid::Uuid::new_v4(),
+            database: None,
+            schema: None,
+            sql_text: "SELECT 1".to_string(),
+            sql_hash: "00".to_string(),
+            action: StatementAction::Select,
+            risk_level: dbx_bastion::policy::RiskLevel::Low,
+            policy_decision: None,
+            source_ip: None,
+            client_request_id: None,
+            status: AuditStatus::Started,
+            success: None,
+            row_count: None,
+            duration_ms: None,
+            error_message: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+        })
+        .await
+        .unwrap();
+    // Keep the service alive until the audit write is flushed; the
+    // record must survive for the server to see it as untriaged.
+    drop(service);
+}
+
+/// Bootstrap a bastion admin user directly in the bastion DB (for tests
+/// that need an authenticated session). Returns (username, password).
+async fn bootstrap_admin(data_dir: &std::path::Path) -> (String, String) {
+    use dbx_bastion::auth::{AdminBootstrap, BootstrapCredentials, BootstrapPolicy, PasswordConfig, PasswordService};
+    let service = BastionService::open(data_dir.join("bastion").join("bastion.db")).unwrap();
+    let passwords = PasswordService::new(PasswordConfig::default()).unwrap();
+    let bootstrap = AdminBootstrap::new(service.store().clone(), passwords, BootstrapPolicy::default());
+    let username = format!("testadmin{}", uuid::Uuid::new_v4().simple());
+    let password = format!("Str0ng!{}", uuid::Uuid::new_v4().simple());
+    bootstrap
+        .bootstrap(&BootstrapCredentials {
+            username: username.clone(),
+            display_name: "Test Admin".to_string(),
+            password: password.clone(),
+        })
+        .await
+        .unwrap();
+    drop(service);
+    (username, password)
 }
 
 #[tokio::test]
@@ -296,7 +322,9 @@ async fn bastion_init_failure_does_not_fall_back_to_legacy() {
 #[tokio::test]
 async fn untriaged_audit_starts_degraded() {
     let dir = tempfile::tempdir().unwrap();
-    seed_untriaged_started(dir.path());
+    seed_untriaged_started(dir.path()).await;
+    // Bootstrap an admin so we can test the execution gate with auth.
+    let (username, password) = bootstrap_admin(dir.path()).await;
     let port = free_port();
     let log_path = dir.path().join("server.log");
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_dbx-web"))
@@ -304,6 +332,8 @@ async fn untriaged_audit_starts_degraded() {
         .env("DBX_PORT", port.to_string())
         .env("DBX_BIND_ADDR", "127.0.0.1")
         .env("DBX_BASTION_MODE", "1")
+        // Execution switch ON: DEGRADED must still refuse.
+        .env("DBX_BASTION_SQL_EXECUTION_ENABLED", "1")
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log_path).unwrap())
@@ -329,6 +359,38 @@ async fn untriaged_audit_starts_degraded() {
     // but execution is refused.
     assert_eq!(status["startup_state"], "degraded");
     assert_eq!(status["execution_refused"], true);
+
+    // Execution gate: login, then query/execute must return 503
+    // (DEGRADED refusal), not execute. The audit record is kept.
+    let login_resp = client
+        .post(format!("http://127.0.0.1:{port}/api/bastion/auth/login"))
+        .json(&serde_json::json!({"username": username, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status(), 200, "login must work in DEGRADED (auth is allowed)");
+    // Extract the session cookie manually (no cookie_store feature).
+    let set_cookie = login_resp.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    let session_cookie = set_cookie.split(';').next().unwrap().to_string();
+    let exec_resp = client
+        .post(format!("http://127.0.0.1:{port}/api/bastion/query/execute"))
+        .header("Cookie", session_cookie)
+        // CSRF: Origin must match Host for POST.
+        .header("Origin", format!("http://127.0.0.1:{port}"))
+        .json(&serde_json::json!({
+            "asset_id": uuid::Uuid::new_v4().to_string(),
+            "sql": "SELECT 1",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(exec_resp.status(), 503, "DEGRADED must refuse SQL execution even with the switch on");
+
+    // The untriaged audit record must still exist (not deleted).
+    let service = BastionService::open(dir.path().join("bastion").join("bastion.db")).unwrap();
+    let audit = SqliteAuditService::new(service.store().clone());
+    assert!(audit.has_untriaged_interruptions().await.unwrap(), "audit record must be kept");
+
     let _ = child.kill().await;
 }
 
@@ -558,6 +620,29 @@ async fn legal_base_path_prefix_serves() {
     // Encoded traversal under the prefix must not bypass.
     let resp = client.get(format!("http://127.0.0.1:{port}/dbx/api/%2e%2e/bastion/health")).send().await.unwrap();
     assert!(!resp.status().is_success(), "encoded traversal must not bypass firewall");
+    // Status endpoint under the prefix: normal.
+    let resp = client.get(format!("http://127.0.0.1:{port}/dbx/api/bastion/status")).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "status under prefix must work");
+    let status: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status["startup_state"], "ready");
+    // Query execute without auth: 401 (auth gate), proving the route
+    // exists under the prefix but is protected — not a silent 404.
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/dbx/api/bastion/query/execute"))
+        .json(&serde_json::json!({"asset_id": uuid::Uuid::new_v4().to_string(), "sql": "SELECT 1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "query execute without auth must be 401");
+    // Legacy query path under the prefix: firewall denies (403),
+    // proving old DBX routes are unreachable.
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/dbx/api/query/execute"))
+        .json(&serde_json::json!({"sql": "SELECT 1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "legacy query path must be denied by firewall");
     let _ = child.kill().await;
 }
 

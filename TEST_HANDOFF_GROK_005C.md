@@ -279,7 +279,7 @@ cargo check -p dbx-bastion -j 1
 cargo check -p dbx-web -j 1
 cargo check -p dbx-web --test bastion_firewall -j 1
 cargo test -p dbx-bastion -j 1              # 204/204 (dev 已通过)
-cargo test -p dbx-web --test bastion_firewall -j 1   # 20 项集成测试 (需高内存)
+cargo test -p dbx-web --test bastion_firewall -j 1   # 19 项集成测试 (需高内存; 第一轮 16 PASS / 3 FAIL, 见 §11)
 # 注意: cargo clippy -p dbx-web --all-targets -- -D warnings 会因
 # dbx-driver-postgres 的 3 处旧 lint 失败 (与本轮无关)
 ```
@@ -301,3 +301,47 @@ cargo test -p dbx-web --test bastion_firewall -j 1   # 20 项集成测试 (需�
 - **管理员密码:** 经 `AdminBootstrap` 写入时即 Argon2 哈希，不落明文
 - **本仓库不含任何真实密码/token/私钥** (已扫描确认)
 - **不要**把测试用的弱密码提交到仓库；CI secrets 走环境变量
+
+---
+
+## 11. 第一轮测试结果与修复 (2026-10-09)
+
+### 11.1 第一轮测试结果 (基线 fc05ed923)
+
+- `cargo fmt`: PASS
+- `cargo check -p dbx-bastion`: PASS
+- `cargo check -p dbx-web`: PASS (测试环境补装 `libfontconfig1-dev` 后)
+- `cargo test -p dbx-bastion`: 204/204 PASS
+- `bastion_firewall` 集成测试: **19 执行、16 PASS、3 FAIL** (确定性复现)
+
+### 11.2 三项失败及修复
+
+1. **DEGRADED 测试 panic**: `seed_untriaged_started` 在 `#[tokio::test]` Runtime 内新建 Runtime 并 `block_on`。
+   修复: 改为 async 函数，使用调用方 Runtime；测试现在真正启动服务、断言 DEGRADED 状态、
+   用登录后的 session 验证 SQL 执行返回 503、审计记录保留。
+
+2. **非根 Base Path 404**: Axum `nest` 去除路径前缀，防火墙作为内层 middleware
+   错误地用完整 base_path 校验已去前缀的 URI。
+   修复: 防火墙移到外层 Router，先校验完整路径 (含 base_path)，再由 nest 路由。
+
+3. **尾斜杠规范化**: `/dbx/` 未正确规范化为 `/dbx`。
+   修复: `normalize_path` 先处理合法尾斜杠，再执行路径段合法性检查。
+   保持: `/dbx//api`、`/dbx/../evil`、`/dbx%2fapi`、`dbx` 继续拒绝。
+
+### 11.3 系统依赖补充 (Debian/Ubuntu)
+
+```bash
+sudo apt-get install -y build-essential pkg-config libfontconfig1-dev git
+```
+
+### 11.4 构建内存要求 (实测更新)
+
+| 步骤 | 峰值 RSS | 说明 |
+|------|----------|------|
+| `cargo check -p dbx-web` | ~2.6 GiB | `-j 1` |
+| `cargo test -p dbx-web --test bastion_firewall` 链接 | **~10.8 GiB** | Grok Bot 环境实测；Muse 云主机 7.7GB/0swap OOM |
+| 推荐 | ≥16 GiB | 或 8GB+swap |
+
+### 11.5 待复测
+
+上述三项修复待 Grok Bot 在高内存环境回归测试。

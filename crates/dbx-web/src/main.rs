@@ -520,19 +520,24 @@ async fn serve_bastion() -> Result<(), String> {
     let public_base_path = bastion::validate_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok().as_deref())
         .map_err(|e| format!("bastion startup failed: {e}"))?;
 
-    // Bastion router (005C-1: health + status only) with the
-    // default-deny firewall as a second layer. The firewall uses an
-    // exact (method, path) whitelist — never prefix matching.
-    let app = bastion::build_bastion_router(bastion_state)
-        .layer(middleware::from_fn_with_state(public_base_path.clone(), bastion::firewall::firewall_middleware))
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+    // Bastion router: inner routes only (no base-path awareness).
+    // The default-deny firewall is the OUTERMOST layer: it validates
+    // the FULL request path (including the public base path) BEFORE
+    // `nest` strips the prefix. As an inner middleware it would see
+    // the already-stripped path and mis-validate against the full
+    // base path. The firewall uses an exact (method, path) whitelist
+    // — never prefix matching.
+    let inner = bastion::build_bastion_router(bastion_state).layer(tower_http::trace::TraceLayer::new_for_http());
 
     let app = if public_base_path == "/" {
-        app
+        inner
     } else {
         // Serve under the configured base path, like legacy mode.
-        axum::Router::new().nest(&public_base_path, app)
+        axum::Router::new().nest(&public_base_path, inner)
     };
+
+    let app =
+        app.layer(middleware::from_fn_with_state(public_base_path.clone(), bastion::firewall::firewall_middleware));
 
     let port: u16 = std::env::var("DBX_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4224);
     let ip = match std::env::var("DBX_BIND_ADDR").ok().as_deref().map(str::trim).filter(|value| !value.is_empty()) {
