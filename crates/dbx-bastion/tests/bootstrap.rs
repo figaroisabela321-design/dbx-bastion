@@ -19,7 +19,9 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_db_path(file: &str) -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("dbx-bastion-test-{}-{}-{}", std::process::id(), id, file))
+    // Dedicated subdirectory: SqliteStore::open enforces 0700 on the
+    // parent dir, and the shared /tmp itself is 1777.
+    std::env::temp_dir().join(format!("dbx-bastion-test-{}-{}", std::process::id(), id)).join(file)
 }
 
 fn cleanup(path: &PathBuf) {
@@ -208,7 +210,7 @@ async fn bastion_db_is_isolated_from_sibling_database_files() {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::SeqCst)
     ));
-    std::fs::create_dir_all(&dir).unwrap();
+    dbx_bastion::secure_dir::ensure_secure_dir(&dir).unwrap();
     let dbx_path = dir.join("dbx.db");
     let bastion_path = dir.join("bastion.db");
 

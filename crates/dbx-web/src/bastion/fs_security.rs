@@ -131,10 +131,14 @@ fn check_data_dir_unix(dir: &Path) -> Result<(), String> {
         ));
     }
     let p_mode = pmeta.mode() & 0o777;
-    if p_mode & 0o022 != 0 {
+    // World-writable without the sticky bit: untrusted users could
+    // rename/replace the data directory. The sticky bit (e.g. /tmp
+    // at 1777) restricts rename/delete to the owner.
+    let has_sticky = pmeta.mode() & 0o1000 != 0;
+    if p_mode & 0o022 != 0 && !has_sticky {
         return Err(format!(
             "bastion startup failed: parent dir {} of bastion dir is writable by group/other \
-             ({p_mode:04o}); untrusted users could replace the data directory",
+             ({p_mode:04o}) without the sticky bit; untrusted users could replace the data directory",
             parent.display()
         ));
     }
@@ -175,20 +179,24 @@ fn check_file_unix(path: &Path, what: &str) -> Result<(), String> {
 
 /// Create a directory (and parents) with secure permissions when it
 /// does not already exist. Existing directories are never
-/// re-permissioned — use [`check_data_dir_security`] to validate.
+/// Create a bastion data directory with `0700` at creation time (Unix).
+/// The mode is passed to `mkdir(2)` via `DirBuilder::mode` — the
+/// directory never exists with looser permissions (no create-then-
+/// chmod window). If the path already exists (or is a symlink), it is
+/// left untouched; the caller must run [`check_data_dir_security`]
+/// to validate it. Existing permissions are never repaired here.
 #[cfg(unix)]
 pub fn create_dir_secure(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::DirBuilderExt;
 
     if std::fs::symlink_metadata(dir).is_ok() {
         return Ok(()); // exists (or is a symlink) — caller validates
     }
-    std::fs::create_dir_all(dir)
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
         .map_err(|e| format!("bastion startup failed: cannot create bastion dir {}: {e}", dir.display()))?;
-    // Newly created: establish 0700 at creation time. This is not a
-    // repair of existing permissions.
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("bastion startup failed: cannot set 0700 on new bastion dir {}: {e}", dir.display()))?;
     Ok(())
 }
 

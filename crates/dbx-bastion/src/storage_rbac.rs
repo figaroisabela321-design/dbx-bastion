@@ -602,7 +602,9 @@ mod tests {
     use crate::rbac::AuthorizationCheck;
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("dbx-bastion-snapshot-bind-{}-{tag}.db", std::process::id()))
+        // Use a dedicated subdirectory: SqliteStore::open now enforces
+        // 0700 on the parent dir, and the shared /tmp itself is 1777.
+        std::env::temp_dir().join(format!("dbx-bastion-snapshot-bind-{}-{tag}", std::process::id())).join("test.db")
     }
 
     fn rfc3339(dt: chrono::DateTime<chrono::Utc>) -> String {

@@ -62,21 +62,32 @@ impl SqliteStore {
     /// Open the bastion database at `path`, creating parent directories and
     /// the file if needed, then apply pending migrations.
     ///
+    /// Directory security (TASK-005D): the parent directory is created
+    /// with `0700` at creation time (never 0755-then-chmod) or, if it
+    /// already exists, validated (ownership / permissions / symlinks /
+    /// parent) and refused when insecure — never silently repaired.
+    /// The database file is pre-created with `0600` before SQLite opens
+    /// it. Non-Unix platforms are refused.
+    ///
     /// Synchronous by design: call once at startup (wrap in
     /// `spawn_blocking` at the call site if already inside async code).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|error| BastionError::Migration(error.to_string()))?;
+                crate::secure_dir::ensure_secure_dir(parent)?;
             }
         }
+        // Pre-create the file with 0600 so it never exists with looser
+        // permissions (no create-then-chmod window).
+        crate::secure_dir::precreate_secure_file(path)?;
 
         let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         apply_migrations(&mut conn)?;
+        // Idempotent hardening for files created before precreate existed.
         restrict_file_permissions(path)?;
 
         Ok(Self { conn: Arc::new(Mutex::new(conn)), path: path.to_path_buf() })

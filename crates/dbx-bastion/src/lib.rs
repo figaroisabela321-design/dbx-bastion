@@ -37,6 +37,7 @@ pub mod error;
 pub mod policy;
 pub mod query;
 pub mod rbac;
+pub mod secure_dir;
 pub mod storage;
 pub(crate) mod storage_rbac;
 

@@ -28,6 +28,10 @@ tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "sync", 
 # analyzer walks the AST with its own explicit match arms so that an
 # unhandled shape fails closed instead of being silently skipped).
 sqlparser = "0.62"
+# Unix euid/umask for secure directory creation (TASK-005D).
+# dbx-bastion must not depend on dbx-web; this is the direct dep.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 # CancellationToken for the TASK-005B executor contract (same version dbx-core uses).
 tokio-util = "0.7"
 

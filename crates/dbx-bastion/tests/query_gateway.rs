@@ -37,7 +37,10 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_db_path(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("dbx-bastion-gw-test-{}-{}-{}.db", std::process::id(), n, tag))
+    let path =
+        std::env::temp_dir().join(format!("dbx-bastion-gw-test-{}-{}-{}", std::process::id(), n, tag)).join("test.db");
+    dbx_bastion::secure_dir::ensure_secure_dir(path.parent().unwrap()).unwrap();
+    path
 }
 
 fn fast_password_config() -> PasswordConfig {

@@ -30,7 +30,12 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_db_path(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("dbx-bastion-auth-test-{}-{}-{}.db", std::process::id(), n, tag))
+    let path = std::env::temp_dir()
+        .join(format!("dbx-bastion-auth-test-{}-{}-{}", std::process::id(), n, tag))
+        .join("test.db");
+    // Ensure the parent exists (securely) for tests using rusqlite directly.
+    dbx_bastion::secure_dir::ensure_secure_dir(path.parent().unwrap()).unwrap();
+    path
 }
 
 /// Fast-but-meaningful Argon2 params for tests (still Argon2id + PHC).
@@ -602,7 +607,7 @@ async fn sibling_dbx_db_untouched() {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::SeqCst)
     ));
-    std::fs::create_dir_all(&dir).unwrap();
+    dbx_bastion::secure_dir::ensure_secure_dir(&dir).unwrap();
     let dbx_path = dir.join("dbx.db");
     {
         let conn = rusqlite::Connection::open(&dbx_path).unwrap();
