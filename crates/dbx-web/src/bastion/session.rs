@@ -2,10 +2,14 @@
 //!
 //! HTTP adapter between the bastion session cookie and
 //! [`AuthenticatedPrincipal`]. Security properties:
-//! - The session token comes **only** from the `__Host-bastion-session`
-//!   cookie (`HttpOnly`, `Secure` by default, `SameSite=Lax`, `Path=/`,
-//!   no `Domain`). It is never read from query params, headers, or
-//!   request bodies, and never written to `localStorage`.
+//! - The session token comes **only** from the session cookie:
+//!   production uses `__Host-bastion-session` (`HttpOnly`, `Secure`,
+//!   `SameSite=Lax`, `Path=/`, no `Domain`); non-TLS dev/test
+//!   (`DBX_BASTION_ALLOW_INSECURE_COOKIE=1`) uses the distinct
+//!   `bastion-session-insecure` name without `Secure`, because
+//!   browsers reject `__Host-` cookies lacking `Secure`. The token is
+//!   never read from query params, headers, or request bodies, and
+//!   never written to `localStorage`.
 //! - The token is validated on **every request** via
 //!   `AuthService::authenticate`, which re-checks revocation, expiry,
 //!   idle timeout, and user-enabled state. A revoked session is
@@ -51,15 +55,14 @@ impl CookieConfig {
         let allow_insecure = std::env::var("DBX_BASTION_ALLOW_INSECURE_COOKIE")
             .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
-        let mut policy = SessionCookiePolicy::default();
         if allow_insecure {
-            policy.secure = false;
             tracing::warn!(
-                "DBX_BASTION_ALLOW_INSECURE_COOKIE=1: session cookie without Secure; \
-                 only use for non-TLS dev/test, never in production"
+                "DBX_BASTION_ALLOW_INSECURE_COOKIE=1: using insecure dev cookie \
+                 'bastion-session-insecure' without Secure; only for non-TLS dev/test, never in production"
             );
+            return Self { policy: SessionCookiePolicy::insecure_dev() };
         }
-        Self { policy }
+        Self { policy: SessionCookiePolicy::default() }
     }
 
     pub fn cookie_name(&self) -> &'static str {

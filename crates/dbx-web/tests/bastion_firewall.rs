@@ -690,3 +690,99 @@ async fn base_path_trailing_slash_normalized() {
     .expect("server did not start");
     let _ = child.kill().await;
 }
+
+/// Insecure dev cookie mode (`DBX_BASTION_ALLOW_INSECURE_COOKIE=1`):
+/// login succeeds over plain HTTP, the session cookie uses the
+/// non-`__Host-` name, `/auth/me` works with the cookie, and logout
+/// clears it. Production (`__Host-` + `Secure`) is unchanged.
+#[tokio::test]
+async fn insecure_cookie_dev_mode_login_me_logout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (username, password) = bootstrap_admin(dir.path()).await;
+    // TASK-005D: bootstrap must create the bastion dir with 0700
+    // (not 0755), so dbx-web can start afterwards.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bastion_dir = dir.path().join("bastion");
+        let mode = std::fs::metadata(&bastion_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "bastion dir after bootstrap must be 0700");
+        let db_mode = std::fs::metadata(bastion_dir.join("bastion.db")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(db_mode, 0o600, "bastion.db after bootstrap must be 0600");
+    }
+    let port = free_port();
+    let log_path = dir.path().join("server.log");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_dbx-web"))
+        .env("DBX_DATA_DIR", dir.path())
+        .env("DBX_PORT", port.to_string())
+        .env("DBX_BIND_ADDR", "127.0.0.1")
+        .env("DBX_BASTION_MODE", "1")
+        .env("DBX_BASTION_ALLOW_INSECURE_COOKIE", "1")
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log_path).unwrap())
+        .spawn()
+        .unwrap();
+    let client = reqwest::Client::new();
+    let origin = format!("http://127.0.0.1:{port}");
+
+    // Wait for the server.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(resp) = client.get(format!("{origin}/api/bastion/health")).send().await {
+                if resp.status().is_success() {
+                    return;
+                }
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("server exited {status}: {}", std::fs::read_to_string(&log_path).unwrap());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("server did not start");
+
+    // Login with Origin (CSRF).
+    let login_resp = client
+        .post(format!("{origin}/api/bastion/auth/login"))
+        .header("Origin", &origin)
+        .json(&serde_json::json!({"username": username, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status(), 200, "login must succeed in insecure dev mode");
+    let set_cookie = login_resp.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    // Must use the non-__Host- name (browsers reject __Host- without Secure).
+    assert!(set_cookie.starts_with("bastion-session-insecure="), "unexpected Set-Cookie: {set_cookie}");
+    assert!(!set_cookie.contains("__Host-"), "must not use __Host- prefix without Secure");
+    assert!(!set_cookie.to_lowercase().contains("secure"), "dev cookie must not claim Secure");
+    let session_cookie = set_cookie.split(';').next().unwrap().to_string();
+
+    // Authenticated request with the cookie: /auth/me works.
+    let me_resp =
+        client.get(format!("{origin}/api/bastion/auth/me")).header("Cookie", &session_cookie).send().await.unwrap();
+    assert_eq!(me_resp.status(), 200, "/auth/me must work with the dev cookie");
+    let me: serde_json::Value = me_resp.json().await.unwrap();
+    assert_eq!(me["username"], username);
+
+    // Logout clears the cookie (with Origin for CSRF).
+    let logout_resp = client
+        .post(format!("{origin}/api/bastion/auth/logout"))
+        .header("Origin", &origin)
+        .header("Cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout_resp.status(), 200, "logout must succeed");
+    let clear_cookie = logout_resp.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    assert!(clear_cookie.starts_with("bastion-session-insecure="), "logout must clear the same cookie");
+    assert!(clear_cookie.contains("Max-Age=0"), "logout must expire the cookie");
+
+    // After logout, the session is revoked: /auth/me is 401.
+    let me_resp =
+        client.get(format!("{origin}/api/bastion/auth/me")).header("Cookie", &session_cookie).send().await.unwrap();
+    assert_eq!(me_resp.status(), 401, "revoked session must be rejected");
+
+    let _ = child.kill().await;
+}

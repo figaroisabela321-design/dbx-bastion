@@ -44,11 +44,21 @@ impl SameSite {
     }
 }
 
-/// Policy for the bastion session cookie. Constructed once by the web
-/// adapter; `__Host-` semantics are baked in.
+/// Policy for the bastion session cookie.
+///
+/// Two modes:
+/// - **Production** (default): `__Host-bastion-session` with `Secure`,
+///   `HttpOnly`, `Path=/`, no `Domain`. The `__Host-` prefix mandates
+///   `Secure` per the cookie spec — browsers reject `__Host-` cookies
+///   without it.
+/// - **Insecure dev** (explicit opt-in): `bastion-session-insecure`
+///   (no `__Host-` prefix) without `Secure`. For non-HTTPS dev/test
+///   only; never use in production. The different name makes it
+///   impossible to confuse the two modes.
 #[derive(Debug, Clone)]
 pub struct SessionCookiePolicy {
-    /// Full cookie name, including the `__Host-` prefix.
+    /// Full cookie name. Production: `__Host-bastion-session`.
+    /// Insecure dev: `bastion-session-insecure` (no `__Host-` prefix).
     pub name: &'static str,
     pub same_site: SameSite,
     /// Set when the deployment serves HTTPS (required for `__Host-`).
@@ -64,6 +74,14 @@ impl Default for SessionCookiePolicy {
 }
 
 impl SessionCookiePolicy {
+    /// Insecure development policy: non-HTTPS only. Uses a distinct
+    /// cookie name WITHOUT the `__Host-` prefix, because browsers
+    /// reject `__Host-` cookies that lack the `Secure` attribute.
+    /// Never use in production.
+    pub fn insecure_dev() -> Self {
+        Self { name: "bastion-session-insecure", same_site: SameSite::Lax, secure: false, max_age_secs: 12 * 3600 }
+    }
+
     /// Build the `Set-Cookie` header value carrying `raw_token`.
     /// `__Host-` prefix mandates `Secure`, `Path=/` and no `Domain`.
     pub fn set_cookie_value(&self, raw_token: &str) -> String {
