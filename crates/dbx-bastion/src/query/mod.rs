@@ -35,6 +35,7 @@ pub use policy::{PolicyContext, PolicyDecision, PolicyReason, SqlPolicy};
 
 use std::time::Duration;
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -138,7 +139,7 @@ impl ExecutionContext {
 /// executor; this type only carries what the backend produced, plus
 /// truncation markers. It never contains credentials, connection
 /// objects, or internal error stacks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QueryResultDto {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,

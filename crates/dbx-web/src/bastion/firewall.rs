@@ -31,21 +31,32 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("GET", "/api/bastion/auth/me"),
     ("GET", "/api/bastion/assets"),
     ("GET", "/api/bastion/assets/{id}"),
-    // 005C-4 adds: ("POST", "/api/bastion/query/execute"),
+    ("POST", "/api/bastion/query/execute"),
+    ("GET", "/api/bastion/audit/interruptions"),
+    ("POST", "/api/bastion/audit/interruptions/{id}/triage"),
 ];
 
 fn path_matches(pattern: &str, path: &str) -> bool {
     if !pattern.contains('{') {
         return pattern == path;
     }
-    // Only supported placeholder: a trailing `/{id}` that must be a UUID.
-    if let Some(prefix) = pattern.strip_suffix("/{id}") {
-        if let Some(rest) = path.strip_prefix(prefix) {
-            let id = rest.strip_prefix('/').unwrap_or(rest);
-            return !id.is_empty() && !id.contains('/') && uuid::Uuid::parse_str(id).is_ok();
+    // Placeholder segments (`{id}`) match exactly one path segment
+    // which must parse as a UUID. All other segments match exactly.
+    let pattern_segs: Vec<&str> = pattern.split('/').collect();
+    let path_segs: Vec<&str> = path.split('/').collect();
+    if pattern_segs.len() != path_segs.len() {
+        return false;
+    }
+    for (p, s) in pattern_segs.iter().zip(path_segs.iter()) {
+        if *p == "{id}" {
+            if s.is_empty() || uuid::Uuid::parse_str(s).is_err() {
+                return false;
+            }
+        } else if p != s {
+            return false;
         }
     }
-    false
+    true
 }
 
 /// Validate and normalize `DBX_PUBLIC_BASE_PATH` for bastion mode.
@@ -207,15 +218,19 @@ mod tests {
     fn uuid_path_param() {
         let id = "550e8400-e29b-41d4-a716-446655440000";
         assert!(is_allowed(&Method::GET, &format!("/api/bastion/assets/{id}")));
+        assert!(is_allowed(&Method::POST, &format!("/api/bastion/audit/interruptions/{id}/triage")));
         // Non-UUID, empty, or multi-segment ids are rejected.
         assert!(!is_allowed(&Method::GET, "/api/bastion/assets/not-a-uuid"));
         assert!(!is_allowed(&Method::GET, "/api/bastion/assets/"));
         assert!(!is_allowed(&Method::GET, "/api/bastion/assets"));
         assert!(!is_allowed(&Method::GET, &format!("/api/bastion/assets/{id}/extra")));
-        // Wrong method on the parameterized route.
+        assert!(!is_allowed(&Method::POST, &format!("/api/bastion/audit/interruptions/{id}/triage/extra")));
+        // Wrong method on the parameterized routes.
         assert!(!is_allowed(&Method::POST, &format!("/api/bastion/assets/{id}")));
-        // Query-execute is not allowlisted yet (005C-4).
-        assert!(!is_allowed(&Method::POST, "/api/bastion/query/execute"));
+        assert!(!is_allowed(&Method::GET, &format!("/api/bastion/audit/interruptions/{id}/triage")));
+        // Query-execute is allowlisted now (005C-4).
+        assert!(is_allowed(&Method::POST, "/api/bastion/query/execute"));
+        assert!(!is_allowed(&Method::GET, "/api/bastion/query/execute"));
     }
 
     #[test]

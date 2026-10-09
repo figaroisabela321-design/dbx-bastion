@@ -1,4 +1,4 @@
-//! Bastion HTTP routes (TASK-005C-2).
+//! Bastion HTTP routes (TASK-005C-4).
 //!
 //! Registered:
 //! - `GET /api/bastion/health` — liveness, no auth.
@@ -8,10 +8,15 @@
 //! - `GET /api/bastion/auth/me` — current user (session required).
 //! - `GET /api/bastion/assets` — CONNECT-gated asset views.
 //! - `GET /api/bastion/assets/:id` — single CONNECT-gated asset view.
+//! - `POST /api/bastion/query/execute` — the only SQL execution entry
+//!   (gated by `DBX_BASTION_SQL_EXECUTION_ENABLED`, degraded refusal,
+//!   and the full gateway chain).
+//! - `GET /api/bastion/audit/interruptions` — admin-only.
+//! - `POST /api/bastion/audit/interruptions/:id/triage` — admin-only
+//!   controlled recovery.
 //!
-//! No query execution route yet (005C-4). The default-deny firewall
-//! (`firewall.rs`) mirrors this list; anything not listed does not
-//! exist.
+//! The default-deny firewall (`firewall.rs`) mirrors this list;
+//! anything not listed does not exist.
 
 use std::sync::Arc;
 
@@ -62,5 +67,8 @@ pub fn build_bastion_router(state: Arc<BastionState>) -> Router {
         .route("/api/bastion/auth/me", get(handlers::me))
         .route("/api/bastion/assets", get(handlers::list_assets))
         .route("/api/bastion/assets/{id}", get(handlers::get_asset))
+        .route("/api/bastion/query/execute", post(handlers::execute_query))
+        .route("/api/bastion/audit/interruptions", get(handlers::list_interruptions))
+        .route("/api/bastion/audit/interruptions/{id}/triage", post(handlers::triage_interruption))
         .with_state(state)
 }

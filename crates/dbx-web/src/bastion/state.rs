@@ -42,6 +42,9 @@ pub struct BastionState {
     /// queries, pools). Bastion never uses the legacy password auth or
     /// legacy routes; this is only the connection/execution substrate.
     pub dbx: Arc<dbx_core::connection::AppState>,
+    /// Query gateway with the real DBX executor (005C-3/4). `None`
+    /// until wired in `init`.
+    pub gateway: Option<Arc<dbx_bastion::query::QueryGateway>>,
     /// Session cookie policy for this process.
     pub cookie_config: super::session::CookieConfig,
     /// Startup state decided during initialization.
@@ -121,9 +124,18 @@ impl BastionState {
         }
 
         let cookie_config = super::session::CookieConfig::from_env();
+
+        // Wire the query gateway with the real DBX executor (005C-3/4).
+        let store = service.store().clone();
+        let clock: Arc<dyn dbx_bastion::auth::Clock> = Arc::new(dbx_bastion::auth::SystemClock);
+        let audit = Arc::new(dbx_bastion::audit::SqliteAuditService::new(store.clone()));
+        let executor = Arc::new(super::executor::DbxQueryExecutor::new(dbx.clone(), store.clone(), clock.clone()));
+        let gateway = Arc::new(dbx_bastion::query::QueryGateway::new(store, clock, audit, executor));
+
         Ok(Arc::new(Self {
             service,
             dbx,
+            gateway: Some(gateway),
             cookie_config,
             startup_state,
             _instance_lock: lock_file,

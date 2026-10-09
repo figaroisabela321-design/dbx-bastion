@@ -17,6 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use dbx_bastion::audit::AuditService;
 use dbx_bastion::auth::LoginRequest;
 use serde::{Deserialize, Serialize};
 
@@ -172,5 +173,145 @@ pub async fn get_asset(
     match state.asset_service().get_asset_view(&session.principal, asset_id).await {
         Ok(view) => Json(view).into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query execution (005C-4)
+// ---------------------------------------------------------------------------
+
+/// Independent safety switch: even in bastion mode, real SQL execution
+/// requires `DBX_BASTION_SQL_EXECUTION_ENABLED=1`. Default is deny.
+/// This switch never bypasses session, RBAC, policy, approval, audit,
+/// asset state, or execution limits — and production assets stay denied
+/// regardless.
+fn sql_execution_enabled() -> bool {
+    std::env::var("DBX_BASTION_SQL_EXECUTION_ENABLED")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+#[derive(serde::Deserialize)]
+pub struct ExecuteQueryBody {
+    pub asset_id: String,
+    pub sql: String,
+    pub max_rows: Option<u64>,
+    pub timeout_secs: Option<u64>,
+}
+
+/// `POST /api/bastion/query/execute` — the only bastion SQL entry.
+///
+/// Full chain: session → principal → gateway (asset resolve →
+/// analyzer → policy → RBAC → audit STARTED → re-verify → executor →
+/// audit completion). Refused when the execution switch is off, when
+/// degraded, or when the gateway denies.
+pub async fn execute_query(
+    State(state): State<Arc<BastionState>>,
+    parts: Parts,
+    session: BastionSession,
+    Json(body): Json<ExecuteQueryBody>,
+) -> Response {
+    if let Err(reject) = check_csrf(&parts) {
+        return reject;
+    }
+    if !sql_execution_enabled() {
+        return (StatusCode::FORBIDDEN, "sql execution is not enabled").into_response();
+    }
+    if state.execution_refused() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "bastion is degraded: sql execution refused").into_response();
+    }
+    let gateway = match state.gateway.as_ref() {
+        Some(g) => g,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "query gateway not initialized").into_response(),
+    };
+    let asset_id = match uuid::Uuid::parse_str(&body.asset_id) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid asset_id").into_response(),
+    };
+    if body.sql.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "sql is required").into_response();
+    }
+    // Caller-requested limits are clamped server-side by the gateway;
+    // the executor enforces the final values.
+    let mut options = dbx_bastion::query::ExecutionOptions::default();
+    if let Some(mr) = body.max_rows {
+        options.max_rows = mr.clamp(1, 10_000);
+    }
+    if let Some(ts) = body.timeout_secs {
+        options.timeout = std::time::Duration::from_secs(ts.clamp(1, 300));
+    }
+    let req = dbx_bastion::query::GatewayRequest { asset_id, sql: body.sql, options };
+
+    // Client disconnect cancels the gateway's parent token.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    match gateway.execute_with_cancel(&session.principal, req, cancel).await {
+        Ok(dto) => Json(dto).into_response(),
+        Err(e) => {
+            let (status, msg) = match e {
+                dbx_bastion::BastionError::Forbidden(_) => (StatusCode::FORBIDDEN, "access denied"),
+                dbx_bastion::BastionError::NotFound(_) => (StatusCode::NOT_FOUND, "not found"),
+                dbx_bastion::BastionError::AuditFailClosed => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "audit fail-closed: triage required")
+                }
+                dbx_bastion::BastionError::ExecutionTimeout => (StatusCode::GATEWAY_TIMEOUT, "execution timed out"),
+                dbx_bastion::BastionError::ExecutionCancelled => (StatusCode::from_u16(499).unwrap(), "cancelled"),
+                _ => (StatusCode::BAD_GATEWAY, "execution failed"),
+            };
+            (status, msg).into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit recovery (005C-4, admin-only)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct TriageBody {
+    pub reason: String,
+    pub evidence: Option<String>,
+}
+
+/// `GET /api/bastion/audit/interruptions` — list untriaged audit
+/// records. Requires bastion-admin (verified per call, not from the
+/// principal snapshot).
+pub async fn list_interruptions(State(state): State<Arc<BastionState>>, session: BastionSession) -> Response {
+    if state.asset_service().guard().check(&session.principal).await.is_err() {
+        return (StatusCode::FORBIDDEN, "admin required").into_response();
+    }
+    let audit = dbx_bastion::audit::SqliteAuditService::new(state.service.store().clone());
+    match audit.list_unfinished().await {
+        Ok(items) => Json(items).into_response(),
+        Err(_) => (StatusCode::BAD_GATEWAY, "audit unavailable").into_response(),
+    }
+}
+
+/// `POST /api/bastion/audit/interruptions/:id/triage` — controlled
+/// recovery. Requires bastion-admin + non-empty reason. The record is
+/// transitioned to `failed` with triage metadata; never deleted, never
+/// silently reset.
+pub async fn triage_interruption(
+    State(state): State<Arc<BastionState>>,
+    parts: Parts,
+    session: BastionSession,
+    Path(id): Path<String>,
+    Json(body): Json<TriageBody>,
+) -> Response {
+    if let Err(reject) = check_csrf(&parts) {
+        return reject;
+    }
+    let admin_id = match state.asset_service().guard().check(&session.principal).await {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::FORBIDDEN, "admin required").into_response(),
+    };
+    let record_id = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    let audit = dbx_bastion::audit::SqliteAuditService::new(state.service.store().clone());
+    match audit.triage_interruption(record_id, admin_id, &body.reason, body.evidence.as_deref().unwrap_or("")).await {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(dbx_bastion::BastionError::NotFound(_)) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(_) => (StatusCode::BAD_REQUEST, "triage failed").into_response(),
     }
 }

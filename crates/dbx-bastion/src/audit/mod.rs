@@ -125,7 +125,7 @@ pub struct AuditOutcome {
 
 /// Audit service contract (implemented in TASK-005B).
 /// A non-terminal audit row, for interruption triage.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UnfinishedAudit {
     pub id: Uuid,
     pub status: AuditStatus,

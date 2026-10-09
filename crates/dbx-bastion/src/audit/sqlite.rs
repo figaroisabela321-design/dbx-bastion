@@ -237,6 +237,46 @@ impl AuditService for SqliteAuditService {
     }
 }
 
+impl SqliteAuditService {
+    /// Triage an unfinished audit record (`started` or
+    /// `unknown_interrupted`) after operator review.
+    ///
+    /// This is the controlled recovery path: the caller must have
+    /// verified admin identity (via `AssetAdminGuard`), and must
+    /// supply a reason and evidence. The record transitions to
+    /// `failed` with triage metadata appended — it is never deleted
+    /// and the status is never silently reset.
+    pub async fn triage_interruption(&self, id: Uuid, triaged_by: Uuid, reason: &str, evidence: &str) -> Result<()> {
+        if reason.trim().is_empty() {
+            return Err(BastionError::InvalidData("triage reason is required".to_string()));
+        }
+        let triage_note = format!(
+            "[triaged by {triaged_by} at {}: {} | evidence: {}]",
+            chrono::Utc::now().to_rfc3339(),
+            reason.trim(),
+            evidence.trim(),
+        );
+        let updated = self
+            .store
+            .blocking(move |conn| {
+                // Only unfinished rows may be triaged.
+                let updated = conn.execute(
+                    "UPDATE audit_events SET status = 'failed', success = 0,
+                     error_message = COALESCE(error_message, '') || ?1,
+                     finished_at = ?2
+                     WHERE id = ?3 AND status IN ('started', 'unknown_interrupted')",
+                    rusqlite::params![triage_note, chrono::Utc::now().to_rfc3339(), id.to_string(),],
+                )?;
+                Ok(updated)
+            })
+            .await?;
+        if updated != 1 {
+            return Err(BastionError::NotFound(format!("unfinished audit record {id} not found")));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
