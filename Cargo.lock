@@ -2765,6 +2765,7 @@ dependencies = [
  "aes-gcm 0.10.3",
  "argon2",
  "async-stream",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",

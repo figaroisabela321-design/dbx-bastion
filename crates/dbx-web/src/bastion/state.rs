@@ -37,23 +37,34 @@ pub enum StartupState {
 /// Shared bastion state for the web process.
 pub struct BastionState {
     /// The bastion domain service (auth, assets, RBAC, audit, gateway).
-    /// Not queried yet in 005C-1; 005C-2/4 wire the guarded endpoints.
-    #[allow(dead_code)]
     pub service: dbx_bastion::BastionService,
+    /// DBX connection/execution state (connection registry, running
+    /// queries, pools). Bastion never uses the legacy password auth or
+    /// legacy routes; this is only the connection/execution substrate.
+    pub dbx: Arc<dbx_core::connection::AppState>,
+    /// Session cookie policy for this process.
+    pub cookie_config: super::session::CookieConfig,
     /// Startup state decided during initialization.
     pub startup_state: StartupState,
     /// Held for the process lifetime; dropping releases the lock.
     _instance_lock: File,
     /// Directory holding `bastion.db` and `bastion.lock`.
-    /// Retained for future management-surface use (005C-2+).
     #[allow(dead_code)]
     pub dir: PathBuf,
 }
 
 impl BastionState {
+    /// Asset service wired with the live DBX connection adapter.
+    /// The adapter is constructed per call (cheap); it shares the
+    /// `Arc<AppState>`.
+    pub fn asset_service(&self) -> dbx_bastion::asset::AssetService {
+        let adapter = Arc::new(super::adapters::WebDbxConnectionAdapter::new(self.dbx.clone()));
+        self.service.asset_service(adapter)
+    }
+
     /// Initialize bastion mode. Every failure is a startup failure —
     /// the caller must exit, never fall back to legacy mode.
-    pub async fn init(dir: &Path) -> Result<Arc<Self>, String> {
+    pub async fn init(dir: &Path, dbx: Arc<dbx_core::connection::AppState>) -> Result<Arc<Self>, String> {
         // 0. Data directory: create with 0700 when missing, then run
         //    the full filesystem security check (ownership, 0700,
         //    no symlinks, safe parent). Any violation is a startup
@@ -109,7 +120,15 @@ impl BastionState {
             );
         }
 
-        Ok(Arc::new(Self { service, startup_state, _instance_lock: lock_file, dir: dir.to_path_buf() }))
+        let cookie_config = super::session::CookieConfig::from_env();
+        Ok(Arc::new(Self {
+            service,
+            dbx,
+            cookie_config,
+            startup_state,
+            _instance_lock: lock_file,
+            dir: dir.to_path_buf(),
+        }))
     }
 
     /// `true` when SQL execution must be refused (degraded startup).

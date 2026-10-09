@@ -17,9 +17,36 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// Exact whitelist entries for 005C-1: `(method, path)` pairs as the
-/// router sees them (after base-path stripping).
-const ALLOWLIST: &[(&str, &str)] = &[("GET", "/api/bastion/health"), ("GET", "/api/bastion/status")];
+/// Exact whitelist entries for bastion mode: `(method, path)` pairs as
+/// the router sees them (after base-path stripping).
+///
+/// `{id}` is a path-parameter placeholder: it matches exactly one
+/// segment, which must parse as a UUID. This is still exact matching —
+/// not a loose prefix.
+const ALLOWLIST: &[(&str, &str)] = &[
+    ("GET", "/api/bastion/health"),
+    ("GET", "/api/bastion/status"),
+    ("POST", "/api/bastion/auth/login"),
+    ("POST", "/api/bastion/auth/logout"),
+    ("GET", "/api/bastion/auth/me"),
+    ("GET", "/api/bastion/assets"),
+    ("GET", "/api/bastion/assets/{id}"),
+    // 005C-4 adds: ("POST", "/api/bastion/query/execute"),
+];
+
+fn path_matches(pattern: &str, path: &str) -> bool {
+    if !pattern.contains('{') {
+        return pattern == path;
+    }
+    // Only supported placeholder: a trailing `/{id}` that must be a UUID.
+    if let Some(prefix) = pattern.strip_suffix("/{id}") {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            let id = rest.strip_prefix('/').unwrap_or(rest);
+            return !id.is_empty() && !id.contains('/') && uuid::Uuid::parse_str(id).is_ok();
+        }
+    }
+    false
+}
 
 /// Validate and normalize `DBX_PUBLIC_BASE_PATH` for bastion mode.
 ///
@@ -135,7 +162,7 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 fn is_allowed(method: &Method, normalized_path: &str) -> bool {
-    ALLOWLIST.iter().any(|(m, p)| method.as_str() == *m && normalized_path == *p)
+    ALLOWLIST.iter().any(|(m, p)| method.as_str() == *m && path_matches(p, normalized_path))
 }
 
 /// Default-deny middleware. `base_path` is the configured
@@ -160,8 +187,13 @@ mod tests {
     fn exact_match_only() {
         assert!(is_allowed(&Method::GET, "/api/bastion/health"));
         assert!(is_allowed(&Method::GET, "/api/bastion/status"));
+        assert!(is_allowed(&Method::POST, "/api/bastion/auth/login"));
+        assert!(is_allowed(&Method::POST, "/api/bastion/auth/logout"));
+        assert!(is_allowed(&Method::GET, "/api/bastion/auth/me"));
+        assert!(is_allowed(&Method::GET, "/api/bastion/assets"));
         // Wrong method.
         assert!(!is_allowed(&Method::POST, "/api/bastion/health"));
+        assert!(!is_allowed(&Method::GET, "/api/bastion/auth/login"));
         // Prefix attacks.
         assert!(!is_allowed(&Method::GET, "/api/bastion/health/extra"));
         assert!(!is_allowed(&Method::GET, "/api/bastion"));
@@ -169,6 +201,21 @@ mod tests {
         // Old routes.
         assert!(!is_allowed(&Method::POST, "/api/query/execute"));
         assert!(!is_allowed(&Method::GET, "/api/query/execute"));
+    }
+
+    #[test]
+    fn uuid_path_param() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(is_allowed(&Method::GET, &format!("/api/bastion/assets/{id}")));
+        // Non-UUID, empty, or multi-segment ids are rejected.
+        assert!(!is_allowed(&Method::GET, "/api/bastion/assets/not-a-uuid"));
+        assert!(!is_allowed(&Method::GET, "/api/bastion/assets/"));
+        assert!(!is_allowed(&Method::GET, "/api/bastion/assets"));
+        assert!(!is_allowed(&Method::GET, &format!("/api/bastion/assets/{id}/extra")));
+        // Wrong method on the parameterized route.
+        assert!(!is_allowed(&Method::POST, &format!("/api/bastion/assets/{id}")));
+        // Query-execute is not allowlisted yet (005C-4).
+        assert!(!is_allowed(&Method::POST, "/api/bastion/query/execute"));
     }
 
     #[test]

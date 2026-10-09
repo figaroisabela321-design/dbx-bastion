@@ -494,9 +494,25 @@ async fn serve_bastion() -> Result<(), String> {
     });
     let bastion_dir = data_dir.join("bastion");
 
-    // Initialize bastion state: instance lock, store, audit triage
-    // check. Any error here is fatal (no legacy fallback).
-    let bastion_state = bastion::BastionState::init(&bastion_dir).await?;
+    // DBX connection/execution substrate for the bastion adapter and
+    // (005C-3) query executor. This is NOT the legacy web stack: no
+    // password auth, no legacy routes, no /mcp. Connection configs are
+    // loaded from the existing DBX storage so previously configured
+    // connections remain addressable by asset mapping.
+    let dbx_storage = dbx_core::persistence::storage::Storage::open_unmigrated(&data_dir.join("dbx.db"))
+        .await
+        .map_err(|e| format!("bastion startup failed: cannot open DBX storage: {e}"))?;
+    let dbx_app = std::sync::Arc::new(dbx_core::connection::AppState::new(dbx_storage.clone()));
+    if let Ok(configs) = dbx_storage.load_connections().await {
+        let mut guard = dbx_app.configs.write().await;
+        for cfg in configs {
+            guard.insert(cfg.id.clone(), cfg);
+        }
+    }
+
+    // Initialize bastion state: fs security, instance lock, store,
+    // audit triage check. Any error here is fatal (no legacy fallback).
+    let bastion_state = bastion::BastionState::init(&bastion_dir, dbx_app).await?;
     tracing::info!("bastion mode: startup state = {:?}", bastion_state.startup_state);
 
     // Strict base-path validation: illegal values are a diagnosable

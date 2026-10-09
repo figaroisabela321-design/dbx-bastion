@@ -1,19 +1,28 @@
-//! Bastion HTTP routes (TASK-005C-1).
+//! Bastion HTTP routes (TASK-005C-2).
 //!
-//! 005C-1 registers only:
+//! Registered:
 //! - `GET /api/bastion/health` — liveness, no auth.
 //! - `GET /api/bastion/status` — mode + startup state, no auth.
+//! - `POST /api/bastion/auth/login` — username/password → session cookie.
+//! - `POST /api/bastion/auth/logout` — revoke session, clear cookie.
+//! - `GET /api/bastion/auth/me` — current user (session required).
+//! - `GET /api/bastion/assets` — CONNECT-gated asset views.
+//! - `GET /api/bastion/assets/:id` — single CONNECT-gated asset view.
 //!
-//! No query execution, no auth endpoints, no admin endpoints yet.
-//! Those arrive in 005C-2/005C-4 with their authentication and guards.
-//! In particular there is deliberately **no** `/api/bastion/query/*`
-//! route in this phase.
+//! No query execution route yet (005C-4). The default-deny firewall
+//! (`firewall.rs`) mirrors this list; anything not listed does not
+//! exist.
 
 use std::sync::Arc;
 
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
 use serde::Serialize;
 
+use super::handlers;
 use super::state::{BastionState, StartupState};
 
 #[derive(Serialize)]
@@ -42,7 +51,16 @@ async fn status(State(state): State<Arc<BastionState>>) -> Json<StatusResponse> 
 }
 
 /// Build the bastion API router. This is the **complete** route set for
-/// bastion mode in 005C-1: anything not listed here does not exist.
+/// bastion mode: anything not listed here does not exist. The firewall
+/// allowlist must be kept in sync (see `firewall::ALLOWLIST`).
 pub fn build_bastion_router(state: Arc<BastionState>) -> Router {
-    Router::new().route("/api/bastion/health", get(health)).route("/api/bastion/status", get(status)).with_state(state)
+    Router::new()
+        .route("/api/bastion/health", get(health))
+        .route("/api/bastion/status", get(status))
+        .route("/api/bastion/auth/login", post(handlers::login))
+        .route("/api/bastion/auth/logout", post(handlers::logout))
+        .route("/api/bastion/auth/me", get(handlers::me))
+        .route("/api/bastion/assets", get(handlers::list_assets))
+        .route("/api/bastion/assets/{id}", get(handlers::get_asset))
+        .with_state(state)
 }

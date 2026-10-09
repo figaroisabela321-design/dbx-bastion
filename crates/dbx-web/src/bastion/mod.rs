@@ -12,13 +12,16 @@
 //! - Any bastion initialization failure is a startup failure; the
 //!   process never falls back to legacy mode.
 
+pub mod adapters;
 pub mod firewall;
 pub mod fs_security;
+pub mod handlers;
 pub mod mode;
 pub mod routes;
+pub mod session;
 pub mod state;
 
 pub use firewall::validate_base_path;
 pub use mode::{check_mode_conflict, run_mode_from_env, RunMode};
 pub use routes::build_bastion_router;
-pub use state::BastionState;
+pub use state::{BastionState, StartupState};
