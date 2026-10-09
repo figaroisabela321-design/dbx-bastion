@@ -1,4 +1,5 @@
 mod auth;
+mod bastion;
 mod demo;
 mod error;
 mod routes;
@@ -478,6 +479,60 @@ fn web_mcp_startup_error(error: String) -> String {
     format!("Failed to start DBX Web: invalid Web MCP configuration: {error}")
 }
 
+/// Serve in bastion mode (TASK-005C-1).
+///
+/// The bastion router contains only health/status in this phase. No
+/// legacy routes are registered, `/mcp` is not mounted, and the old
+/// single-password auth is not initialized. Any initialization failure
+/// is a startup failure — this function never falls back to legacy.
+async fn serve_bastion() -> Result<(), String> {
+    use axum::middleware;
+
+    let data_dir = std::env::var("DBX_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home).join(".dbx-web")
+    });
+    let bastion_dir = data_dir.join("bastion");
+
+    // Initialize bastion state: instance lock, store, audit triage
+    // check. Any error here is fatal (no legacy fallback).
+    let bastion_state = bastion::BastionState::init(&bastion_dir).await?;
+    tracing::info!("bastion mode: startup state = {:?}", bastion_state.startup_state);
+
+    // Strict base-path validation: illegal values are a diagnosable
+    // startup configuration error, never a panic.
+    let public_base_path = bastion::validate_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok().as_deref())
+        .map_err(|e| format!("bastion startup failed: {e}"))?;
+
+    // Bastion router (005C-1: health + status only) with the
+    // default-deny firewall as a second layer. The firewall uses an
+    // exact (method, path) whitelist — never prefix matching.
+    let app = bastion::build_bastion_router(bastion_state)
+        .layer(middleware::from_fn_with_state(public_base_path.clone(), bastion::firewall::firewall_middleware))
+        .layer(tower_http::trace::TraceLayer::new_for_http());
+
+    let app = if public_base_path == "/" {
+        app
+    } else {
+        // Serve under the configured base path, like legacy mode.
+        axum::Router::new().nest(&public_base_path, app)
+    };
+
+    let port: u16 = std::env::var("DBX_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4224);
+    let ip = match std::env::var("DBX_BIND_ADDR").ok().as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value
+            .parse::<std::net::IpAddr>()
+            .unwrap_or_else(|error| panic!("invalid DBX_BIND_ADDR \"{value}\": {error}")),
+        None => std::net::IpAddr::from([0, 0, 0, 0]),
+    };
+    let addr = std::net::SocketAddr::new(ip, port);
+
+    tracing::info!("DBX Web (bastion mode) starting on http://{}", addr);
+    let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind address");
+    axum::serve(listener, app).await.expect("bastion server error");
+    Ok(())
+}
+
 async fn serve() -> Result<(), String> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -487,6 +542,14 @@ async fn serve() -> Result<(), String> {
         .init();
 
     rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
+
+    // Run mode is decided first, before anything else. Invalid values
+    // and conflicts are startup failures — never a silent downgrade.
+    let run_mode = bastion::run_mode_from_env()?;
+    bastion::check_mode_conflict(run_mode)?;
+    if run_mode == bastion::RunMode::Bastion {
+        return serve_bastion().await;
+    }
 
     // Data directory
     let data_dir = std::env::var("DBX_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| {
