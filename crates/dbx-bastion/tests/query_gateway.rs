@@ -774,7 +774,7 @@ async fn triage_confirmed_committed_preserves_original() {
             "DBA confirmed the transaction committed",
             "binlog shows COMMIT at 2026-10-10T10:00:00Z",
             TriageConclusion::ConfirmedCommitted,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap();
@@ -817,7 +817,7 @@ async fn triage_still_unknown_keeps_block() {
             "Cannot determine outcome from logs",
             "",
             TriageConclusion::StillUnknown,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap();
@@ -837,8 +837,8 @@ async fn triage_inflight_started_rejected() {
     let id = event.id;
     audit.record_started(event).await.unwrap();
 
-    let inflight = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-    inflight.lock().await.insert(id);
+    let inflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    inflight.lock().unwrap().insert(id);
 
     let err = audit
         .triage_interruption(id, Uuid::new_v4(), "reason", "evidence", TriageConclusion::ConfirmedNotExecuted, inflight)
@@ -865,7 +865,7 @@ async fn triage_duplicate_rejected() {
             "first",
             "e1",
             TriageConclusion::ConfirmedNotExecuted,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap();
@@ -878,7 +878,7 @@ async fn triage_duplicate_rejected() {
             "second",
             "e2",
             TriageConclusion::ConfirmedNotExecuted,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap_err();
@@ -902,7 +902,7 @@ async fn triage_still_unknown_can_be_followed_up() {
             "logs inconclusive",
             "",
             TriageConclusion::StillUnknown,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap();
@@ -916,7 +916,7 @@ async fn triage_still_unknown_can_be_followed_up() {
             "DBA confirmed via binlog",
             "binlog COMMIT at 2026-10-10T10:00:00Z",
             TriageConclusion::ConfirmedCommitted,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap();
@@ -949,7 +949,7 @@ async fn triage_confirmed_cannot_be_reversed() {
             "confirmed",
             "proof",
             TriageConclusion::ConfirmedCommitted,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap();
@@ -963,7 +963,7 @@ async fn triage_confirmed_cannot_be_reversed() {
                 "try reverse",
                 "e",
                 conclusion,
-                Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+                Arc::new(std::sync::Mutex::new(HashSet::new())),
             )
             .await
             .unwrap_err();
@@ -986,7 +986,7 @@ async fn triage_requires_reason_and_evidence_for_confirmed() {
             "  ",
             "e",
             TriageConclusion::ConfirmedNotExecuted,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap_err();
@@ -1000,7 +1000,7 @@ async fn triage_requires_reason_and_evidence_for_confirmed() {
             "reason",
             "",
             TriageConclusion::ConfirmedCommitted,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap_err();
@@ -1022,7 +1022,7 @@ async fn triage_rejects_overlong_inputs() {
             &long_reason,
             "e",
             TriageConclusion::StillUnknown,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap_err();
@@ -1036,7 +1036,7 @@ async fn triage_rejects_overlong_inputs() {
             "reason",
             &long_evidence,
             TriageConclusion::StillUnknown,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap_err();
@@ -1071,7 +1071,7 @@ async fn triage_terminal_record_rejected() {
             "reason",
             "e",
             TriageConclusion::StillUnknown,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap_err();
@@ -1152,7 +1152,7 @@ async fn lifecycle_orphaned_started_to_ready() {
             "verified never executed",
             "DBA checked: no such transaction in logs",
             TriageConclusion::ConfirmedNotExecuted,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap();
@@ -1172,7 +1172,7 @@ async fn lifecycle_orphaned_started_to_ready() {
             "inconclusive",
             "",
             TriageConclusion::StillUnknown,
-            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap();
@@ -1283,4 +1283,275 @@ async fn gateway_nonrecursive_cte_selfref_does_not_bypass_deny() {
         "non-recursive self-ref must hit DENY, got: {msg}"
     );
     assert_eq!(gw.executor.calls(), 0, "denied query must not reach the executor");
+}
+
+// ===== P0-A/T1: Reverse lock interleaving, no deadlock =====
+
+#[tokio::test]
+async fn t1_no_deadlock_on_reverse_lock_interleaving() {
+    // P0-A: Gateway does SQLite->inflight (sequential). Triage does
+    // inflight-check->SQLite (sequential). No nesting -> no ABBA deadlock.
+    // Run them concurrently with an external timeout; completion proves
+    // no deadlock.
+    let gw = Gw::new("t1-deadlock").await;
+    gw.executor.set_behavior(MockBehavior::Success {
+        columns: vec!["c".to_string()],
+        rows: vec![],
+        affected_rows: None,
+    });
+
+    let audit = SqliteAuditService::new(gw.service.store().clone());
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+    // Orphan (not in inflight) so triage will do its DB work.
+
+    let inflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+    let gateway = Arc::new(QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(SqliteAuditService::new(gw.service.store().clone())) as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    ));
+    let t_execute = {
+        let g = gateway.clone();
+        let u = gw.user.clone();
+        let asset_id = gw.asset_id;
+        tokio::spawn(async move {
+            let req = GatewayRequest { asset_id, sql: "SELECT 1".to_string(), options: ExecutionOptions::default() };
+            g.execute(&u, req).await
+        })
+    };
+    let t_triage = {
+        let inflight = inflight.clone();
+        tokio::spawn(async move {
+            audit
+                .triage_interruption(
+                    id,
+                    Uuid::new_v4(),
+                    "t1 test",
+                    "evidence",
+                    TriageConclusion::ConfirmedNotExecuted,
+                    inflight,
+                )
+                .await
+        })
+    };
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let _ = t_execute.await;
+        let _ = t_triage.await;
+    })
+    .await;
+    assert!(result.is_ok(), "T1: deadlock detected (timeout)");
+}
+
+// ===== P0-A/T2: High-concurrency execute + triage, no deadlock =====
+
+#[tokio::test]
+async fn t2_high_concurrency_no_deadlock() {
+    let gw = Gw::new("t2-concurrent").await;
+    gw.grant(Action::Select, "t").await;
+    gw.executor.set_behavior(MockBehavior::Success {
+        columns: vec!["c".to_string()],
+        rows: vec![],
+        affected_rows: None,
+    });
+    let asset_id = gw.asset_id;
+    let gateway = Arc::new(QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(SqliteAuditService::new(gw.service.store().clone())) as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    ));
+    let mut handles = vec![];
+    for i in 0..20 {
+        let g = gateway.clone();
+        let u = gw.user.clone();
+        let sql = format!("SELECT * FROM appdb.t WHERE id = {i}");
+        handles.push(tokio::spawn(async move {
+            let req = GatewayRequest { asset_id, sql, options: ExecutionOptions::default() };
+            let _ = g.execute(&u, req).await;
+        }));
+    }
+    // Concurrent triages on non-existent IDs (will fail fast, but exercise lock paths).
+    for _ in 0..10 {
+        let store = gw.service.store().clone();
+        handles.push(tokio::spawn(async move {
+            let audit = SqliteAuditService::new(store);
+            let inflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+            let _ = audit
+                .triage_interruption(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    "t2",
+                    "e",
+                    TriageConclusion::StillUnknown,
+                    inflight,
+                )
+                .await;
+        }));
+    }
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        for h in handles {
+            let _ = h.await;
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "T2: deadlock detected (timeout)");
+}
+
+// ===== Issue 3/T3: Abort + lock contention, inflight cleaned up =====
+
+#[tokio::test]
+async fn t3_abort_cleans_up_inflight() {
+    let gw = Gw::new("t3-abort").await;
+    gw.grant(Action::Select, "t").await;
+    let gateway = Arc::new(QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(SqliteAuditService::new(gw.service.store().clone())) as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    ));
+    gw.executor.set_behavior(MockBehavior::Hang);
+
+    let g = gateway.clone();
+    let u = gw.user.clone();
+    let asset_id = gw.asset_id;
+    let handle = tokio::spawn(async move {
+        let req =
+            GatewayRequest { asset_id, sql: "SELECT * FROM appdb.t".to_string(), options: ExecutionOptions::default() };
+        g.execute(&u, req).await
+    });
+
+    // Let it start (register in inflight), then abort.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Verify it's in-flight.
+    assert!(!gateway.inflight_set().lock().unwrap().is_empty(), "should be in-flight before abort");
+    handle.abort();
+    let _ = handle.await;
+
+    // After abort, Drop must have removed the ID (reliable cleanup).
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(gateway.inflight_set().lock().unwrap().is_empty(), "T3: inflight not cleaned up after abort");
+}
+
+// ===== Issue 3/T4: Orphan STARTED must not be masked =====
+
+#[tokio::test]
+async fn t4_orphan_started_blocks_new_query() {
+    let gw = Gw::new("t4-orphan").await;
+    // Directly insert a STARTED row (simulating a crashed process that
+    // never registered in inflight). The gateway's inflight set is empty.
+    let audit = SqliteAuditService::new(gw.service.store().clone());
+    let event = started_event();
+    audit.record_started(event).await.unwrap();
+
+    // New query must be rejected (orphan blocks).
+    let err = gw.gateway.execute(&gw.user, gw.req("SELECT 1")).await.unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("AuditFailClosed") || msg.contains("fail"), "orphan must block, got: {msg}");
+}
+
+// ===== Issue 4/T5: Normal completion + fail_closed_check, no false latch =====
+
+#[tokio::test]
+async fn t5_no_false_latch_on_concurrent_completion() {
+    let gw = Gw::new("t5-nolatch").await;
+    gw.grant(Action::Select, "t").await;
+    let gateway = Arc::new(QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(SqliteAuditService::new(gw.service.store().clone())) as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    ));
+    gw.executor.set_behavior(MockBehavior::Success {
+        columns: vec!["c".to_string()],
+        rows: vec![],
+        affected_rows: None,
+    });
+
+    // Run several queries to completion concurrently.
+    let mut handles = vec![];
+    let asset_id = gw.asset_id;
+    for i in 0..10 {
+        let g = gateway.clone();
+        let u = gw.user.clone();
+        let sql = format!("SELECT * FROM appdb.t WHERE id = {i}");
+        handles.push(tokio::spawn(async move {
+            let req = GatewayRequest { asset_id, sql, options: ExecutionOptions::default() };
+            g.execute(&u, req).await
+        }));
+    }
+    for h in handles {
+        let r = h.await.expect("task");
+        assert!(r.is_ok(), "query should succeed: {r:?}");
+    }
+
+    // After all complete, a new query must NOT be blocked (no false latch).
+    let r = gateway
+        .execute(
+            &gw.user,
+            GatewayRequest {
+                asset_id: gw.asset_id,
+                sql: "SELECT * FROM appdb.t WHERE id = 999".to_string(),
+                options: ExecutionOptions::default(),
+            },
+        )
+        .await;
+    assert!(r.is_ok(), "T5: false fail_closed latch after normal completions: {r:?}");
+}
+
+// ===== T6: Active STARTED triage rejected =====
+
+#[tokio::test]
+async fn t6_triage_active_started_rejected() {
+    // Already covered by triage_inflight_started_rejected, but T6 requires
+    // the gateway's live set (not a manual HashSet).
+    let gw = Gw::new("t6-active").await;
+    gw.grant(Action::Select, "t").await;
+    let gateway = Arc::new(QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(SqliteAuditService::new(gw.service.store().clone())) as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    ));
+    gw.executor.set_behavior(MockBehavior::Hang);
+
+    let g = gateway.clone();
+    let u = gw.user.clone();
+    let asset_id = gw.asset_id;
+    let handle = tokio::spawn(async move {
+        let req =
+            GatewayRequest { asset_id, sql: "SELECT * FROM appdb.t".to_string(), options: ExecutionOptions::default() };
+        g.execute(&u, req).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Get the in-flight ID from the gateway's live set.
+    let inflight_id = {
+        let set = gateway.inflight_set();
+        let guard = set.lock().unwrap();
+        guard.iter().next().cloned().expect("should have in-flight ID")
+    };
+
+    // Triage must be rejected.
+    let audit = SqliteAuditService::new(gw.service.store().clone());
+    let err = audit
+        .triage_interruption(
+            inflight_id,
+            Uuid::new_v4(),
+            "t6",
+            "evidence",
+            TriageConclusion::ConfirmedNotExecuted,
+            gateway.inflight_set(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("actively executing"), "T6: should reject, got: {err}");
+
+    handle.abort();
+    let _ = handle.await;
 }

@@ -333,9 +333,9 @@ pub async fn triage_interruption(
             return (StatusCode::CONFLICT, "audit record is actively executing; triage is forbidden").into_response();
         }
     }
-    let inflight: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<uuid::Uuid>>> =
+    let inflight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>> =
         state.gateway.as_ref().map(|gw| gw.inflight_set()).unwrap_or_else(|| {
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<uuid::Uuid>::new()))
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::<uuid::Uuid>::new()))
         });
     let audit = dbx_bastion::audit::SqliteAuditService::new(state.service.store().clone());
     match audit

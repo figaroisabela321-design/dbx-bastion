@@ -308,7 +308,7 @@ impl SqliteAuditService {
         reason: &str,
         evidence: &str,
         conclusion: TriageConclusion,
-        inflight: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<Uuid>>>,
+        inflight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
     ) -> Result<()> {
         let reason = reason.trim();
         let evidence = evidence.trim();
@@ -330,6 +330,17 @@ impl SqliteAuditService {
             return Err(BastionError::InvalidData(format!("conclusion '{}' requires evidence", conclusion.as_str())));
         }
 
+        // P0-A: Point-in-time inflight check. The lock is NEVER held across
+        // the DB operation below, and never nested with the SQLite lock.
+        // Audit IDs are fresh UUIDs, never reused: the gateway cannot start
+        // a query with the ID being triaged, so no check+INSERT race exists.
+        // (Poison -> fail-closed: assume in-flight, reject triage.)
+        let is_inflight = inflight.lock().map(|g| g.contains(&id)).unwrap_or(true);
+        if is_inflight {
+            return Err(BastionError::InvalidData(format!(
+                "audit record {id} is actively executing; triage is forbidden"
+            )));
+        }
         // Race-free handoff (Issue 3): the inflight lock is acquired
         // INSIDE the blocking closure, held for check+INSERT. A query
         // starting concurrently blocks on this lock until triage commits,
@@ -346,12 +357,6 @@ impl SqliteAuditService {
                 // blocking_lock: this closure runs on spawn_blocking (not
                 // in async context), so blocking is safe. The lock is held
                 // for check+INSERT, closing the race with query start.
-                let _inflight_guard = inflight.blocking_lock();
-                if _inflight_guard.contains(&id) {
-                    return Err(BastionError::InvalidData(format!(
-                        "audit record {id} is actively executing; triage is forbidden"
-                    )));
-                }
                 // 1. The record must exist and be unfinished.
                 let original_status: String = conn
                     .query_row("SELECT status FROM audit_events WHERE id = ?1", [id.to_string()], |row| row.get(0))

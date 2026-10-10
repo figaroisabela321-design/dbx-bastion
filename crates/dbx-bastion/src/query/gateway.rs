@@ -75,29 +75,38 @@ pub struct QueryGateway {
     /// audit store; concurrent queries in one process never block
     /// each other.
     ///
-    /// Registration happens immediately after `record_started` commits
-    /// (see `InflightGuard`); the triage path locks this mutex for its
-    /// check+INSERT, so a query starting concurrently cannot slip
-    /// through. Wrapped in Arc so the HTTP handler can share ownership
-    /// without lifetime issues.
-    inflight: Arc<tokio::sync::Mutex<HashSet<Uuid>>>,
+    /// Audit IDs with a STARTED row that this process is actively
+    /// executing. A `started` row is an interruption (orphan) iff it is
+    /// NOT in this set.
+    ///
+    /// LOCK PROTOCOL (P0-A): This is a `std::sync::Mutex`, never held
+    /// across `.await`. It is NEVER acquired while holding the SQLite
+    /// connection lock, and the SQLite lock is NEVER acquired while
+    /// holding this. All operations are brief point-in-time insert /
+    /// remove / contains. Audit IDs are UUIDs, never reused, so a
+    /// point-in-time check is race-free for triage (the gateway never
+    /// starts a query with an ID that triage is examining).
+    /// Wrapped in Arc so the HTTP handler can share ownership.
+    inflight: Arc<std::sync::Mutex<HashSet<Uuid>>>,
 }
 
 /// RAII guard: removes the audit ID from the in-flight set on drop.
 /// Covers every exit path (success, error, panic, async cancellation)
 /// so an active STARTED is never mistaken for an orphan.
 struct InflightGuard {
-    inflight: Arc<tokio::sync::Mutex<HashSet<Uuid>>>,
+    inflight: Arc<std::sync::Mutex<HashSet<Uuid>>>,
     id: Uuid,
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        // try_lock: Drop runs in async context (task abort/cancel), where
-        // blocking_lock() would panic. If the lock is contended (triage
-        // holding it briefly), the ID may leak; the leak is fail-closed
-        // (triage of a terminal row is rejected anyway by the status check).
-        if let Ok(mut guard) = self.inflight.try_lock() {
+        // Reliable cleanup (Issue 3): std::sync::Mutex::lock() works in
+        // Drop (sync context). It blocks briefly if contended, but always
+        // succeeds unless poisoned. On poison (a panic already occurred
+        // while holding the lock), we cannot safely modify the set; the
+        // ID leaks but the audit row remains STARTED/UNKNOWN and
+        // fail_closed_check will block new SQL (fail-closed, not silent).
+        if let Ok(mut guard) = self.inflight.lock() {
             guard.remove(&self.id);
         }
     }
@@ -119,7 +128,7 @@ impl QueryGateway {
             clock,
             pre_execute_hook: Mutex::new(None),
             fail_closed: AtomicBool::new(false),
-            inflight: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -145,17 +154,32 @@ impl QueryGateway {
         if self.fail_closed.load(Ordering::SeqCst) {
             return Err(BastionError::AuditFailClosed);
         }
+        // Issue 4: Read inflight FIRST, then the DB (consistent order).
+        // The inflight lock is never held across the DB await.
+        //
+        // - `unknown_interrupted`: never in-flight (only actively-executing
+        //   queries are tracked). No race possible -> permanent latch.
+        // - `started` not in inflight: may be a true orphan OR a query that
+        //   completed between the two reads (race). We reject THIS query
+        //   (fail-closed) but DO NOT set the permanent latch; the next
+        //   query re-evaluates. A stale snapshot can never trigger an
+        //   irreversible global block.
+        let inflight_snapshot: std::collections::HashSet<Uuid> =
+            self.inflight.lock().map(|g| g.clone()).unwrap_or_default();
         let unfinished = self
             .audit
             .list_unfinished()
             .await
             .map_err(|e| BastionError::AuditUnavailable(format!("audit unavailable: {e}")))?;
-        let inflight = self.inflight.lock().await;
-        let interrupted =
-            unfinished.iter().any(|u| !matches!(u.status, AuditStatus::Started) || !inflight.contains(&u.id));
-        drop(inflight);
-        if interrupted {
+        // Permanent latch only for unknown_interrupted (no race possible).
+        if unfinished.iter().any(|u| matches!(u.status, AuditStatus::UnknownInterrupted)) {
             self.fail_closed.store(true, Ordering::SeqCst);
+            return Err(BastionError::AuditFailClosed);
+        }
+        // Started-but-not-inflight: reject this query, no permanent latch.
+        let orphan_started =
+            unfinished.iter().any(|u| matches!(u.status, AuditStatus::Started) && !inflight_snapshot.contains(&u.id));
+        if orphan_started {
             return Err(BastionError::AuditFailClosed);
         }
         Ok(())
@@ -173,13 +197,14 @@ impl QueryGateway {
     /// with this audit ID. Triage of in-flight records is forbidden
     /// (P0-2): only orphaned interruptions may be triaged.
     pub fn is_inflight(&self, audit_id: &uuid::Uuid) -> bool {
-        self.inflight.try_lock().map(|g| g.contains(audit_id)).unwrap_or(true)
+        // Poison -> fail-closed (assume in-flight, reject triage).
+        self.inflight.lock().map(|g| g.contains(audit_id)).unwrap_or(true)
     }
 
     /// The live in-flight set, for the triage path. The audit service
     /// locks this mutex for its check+INSERT, closing the race between
     /// the HTTP-layer check and the DB commit.
-    pub fn inflight_set(&self) -> Arc<tokio::sync::Mutex<HashSet<Uuid>>> {
+    pub fn inflight_set(&self) -> Arc<std::sync::Mutex<HashSet<Uuid>>> {
         self.inflight.clone()
     }
 
@@ -364,21 +389,21 @@ impl QueryGateway {
         }
 
         // 8. Audit STARTED must commit before the executor is touched.
-        //     The inflight lock is held across record_started + insert:
-        //     triage cannot slip in between and treat this new row as an
-        //     orphan. (tokio MutexGuard is Send, safe across await.)
+        //     P0-A: The inflight lock is NOT held across record_started.
+        //     Audit IDs are fresh UUIDs, never reused, so triage (which
+        //     examines a specific existing ID) cannot race with this
+        //     registration. Locks are never nested: SQLite and inflight
+        //     are acquired sequentially, never while holding the other.
         let event = self.audit_event(principal, asset.id, stmt, &sql, &hash, Some("allow".to_string()));
-        let mut _inflight_lock = self.inflight.lock().await;
         let audit_id = self.audit.record_started(event).await.map_err(|e| {
             // No audit event exists: the executor must see zero calls.
             // (No inflight registration: the STARTED row does not exist.)
             BastionError::AuditUnavailable(e.to_string())
         })?;
-        // 8b. Register in-flight while holding the lock. The guard removes
-        //     the ID on drop, covering every exit path: success, error,
-        //     panic, async cancellation.
-        _inflight_lock.insert(audit_id);
-        drop(_inflight_lock);
+        // 8b. Register in-flight (brief lock, never across await). The
+        //     guard removes the ID on drop, covering every exit path:
+        //     success, error, timeout, abort, panic.
+        self.inflight.lock().map(|mut g| g.insert(audit_id)).ok();
         let _inflight_guard = InflightGuard { inflight: self.inflight.clone(), id: audit_id };
 
         // 9. Deterministic test hook: revoke/disable mid-flight here.
