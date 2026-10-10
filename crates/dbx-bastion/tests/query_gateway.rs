@@ -1244,3 +1244,43 @@ async fn concurrent_query_not_blocked_by_inflight() {
 
     handle_a.abort();
 }
+
+// ---- P0-B: Non-recursive CTE self-reference must not bypass DENY ----
+
+#[tokio::test]
+async fn gateway_nonrecursive_cte_selfref_does_not_bypass_deny() {
+    let gw = Gw::new("cte-p0b-deny").await;
+    // DENY on appdb.secret for the user's role.
+    let grants = GrantService::new(gw.service.store().clone(), Arc::new(SystemClock));
+    grants
+        .create_grant(
+            &gw.admin,
+            NewGrant {
+                role_id: gw.role_id,
+                effect: Effect::Deny,
+                action: Action::Select,
+                scope: AssetScope::Asset(gw.asset_id),
+                database: Some("appdb".to_string()),
+                schema: None,
+                table: Some("secret".to_string()),
+                expires_at: None,
+            },
+        )
+        .await
+        .expect("deny grant");
+
+    // Attack: non-recursive CTE named `secret` whose body references the
+    // real `secret` table. P0-B fix: the body's `secret` is a REAL TABLE
+    // (not the CTE), so the DENY must fire.
+    let err = gw
+        .gateway
+        .execute(&gw.user, gw.req("WITH secret AS (SELECT * FROM appdb.secret) SELECT * FROM secret"))
+        .await
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("Denied") || msg.contains("denied") || msg.contains("Forbidden") || msg.contains("RBAC"),
+        "non-recursive self-ref must hit DENY, got: {msg}"
+    );
+    assert_eq!(gw.executor.calls(), 0, "denied query must not reach the executor");
+}

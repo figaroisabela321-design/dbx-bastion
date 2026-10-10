@@ -422,18 +422,32 @@ impl<'a> QueryWalker<'a> {
         // - Main query sees: outer CTEs + all CTEs in this WITH clause
         // A CTE body must NOT see later siblings (SQL forbids forward
         // references); the old code pushed all names first, letting a
-        // CTE body skip authorization for a real table sharing a later
-        // sibling's name. Pop afterwards for correct nesting.
+        // P0-B: Distinguish WITH RECURSIVE from plain WITH.
+        // - RECURSIVE: a CTE may reference itself; push the name BEFORE
+        //   walking its body (self-reference resolves to the CTE).
+        // - Non-recursive: the body must NOT see its own name. A same-name
+        //   reference inside the body is a REAL TABLE, not the CTE.
+        //   Walk the body first, then push the name for siblings/main.
+        //   (Forward references to later CTEs are treated as real tables:
+        //   fail-closed, never silently ignored.)
         //
-        // Names are stored in canonical form (PG unquoted identifiers
-        // fold to lowercase; quoted are case-sensitive), matching the
-        // comparison in is_cte.
+        // In both cases, preceding siblings are visible (pushed in order),
+        // and later siblings never shadow tables inside earlier bodies.
         let mut pushed = 0;
         if let Some(with) = q.with.as_ref() {
+            let is_recursive = with.recursive;
             for cte in &with.cte_tables {
-                self.cte_names.push(self.canonical(&cte.alias.name));
-                pushed += 1;
-                self.walk_query(&cte.query)?;
+                let name = self.canonical(&cte.alias.name);
+                if is_recursive {
+                    self.cte_names.push(name);
+                    pushed += 1;
+                    self.walk_query(&cte.query)?;
+                } else {
+                    // Body sees outer scope + preceding siblings only.
+                    self.walk_query(&cte.query)?;
+                    self.cte_names.push(name);
+                    pushed += 1;
+                }
             }
         }
         self.walk_set_expr(&q.body)?;

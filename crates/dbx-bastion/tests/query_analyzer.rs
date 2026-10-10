@@ -708,3 +708,76 @@ fn same_name_cte_and_real_table_coexist() {
     assert_eq!(t.len(), 1, "only the qualified real table: {t:?}");
     assert!(t.iter().any(|(db, _, tbl)| db == &p("appdb") && tbl == "orders"));
 }
+
+// ===== P0-B: Non-recursive CTE self-reference (T7) =====
+
+#[test]
+fn nonrecursive_cte_self_reference_is_real_table_mysql() {
+    // P0-B: `WITH x AS (SELECT * FROM x)` — non-recursive. The `x` inside
+    // the body is a REAL TABLE, not the CTE. Must appear in resources.
+    let s = one("WITH x AS (SELECT * FROM x) SELECT * FROM x", SqlDialect::MySql);
+    let t = tables(&s.sources);
+    assert!(t.iter().any(|(_, _, tbl)| tbl == "x"), "non-recursive self-ref -> real table `x`: {t:?}");
+}
+
+#[test]
+fn nonrecursive_cte_self_reference_is_real_table_postgres() {
+    // PostgreSQL: same, with lowercase folding.
+    let s = one("WITH X AS (SELECT * FROM X) SELECT * FROM X", SqlDialect::Postgres);
+    let t = tables(&s.sources);
+    assert!(t.iter().any(|(_, _, tbl)| tbl == "x"), "PG non-recursive self-ref -> real table `x`: {t:?}");
+}
+
+#[test]
+fn nonrecursive_cte_self_reference_is_real_table_generic() {
+    let s = one("WITH x AS (SELECT * FROM x) SELECT * FROM x", SqlDialect::Generic);
+    let t = tables(&s.sources);
+    assert!(t.iter().any(|(_, _, tbl)| tbl == "x"), "Generic non-recursive self-ref -> real table `x`: {t:?}");
+}
+
+#[test]
+fn recursive_cte_self_reference_is_cte() {
+    // WITH RECURSIVE: self-reference IS the CTE, not a table.
+    // The body references only the CTE; no real tables.
+    let s = one(
+        "WITH RECURSIVE cnt AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM cnt WHERE n < 10) SELECT * FROM cnt",
+        SqlDialect::Postgres,
+    );
+    let t = tables(&s.sources);
+    assert!(t.is_empty(), "recursive self-ref -> CTE, no real tables: {t:?}");
+}
+
+#[test]
+fn nonrecursive_cte_sees_preceding_sibling() {
+    // `b`'s body references `a` (defined earlier) -> CTE, not a table.
+    // `a`'s body references `t` -> real table.
+    let s = one("WITH a AS (SELECT * FROM t), b AS (SELECT * FROM a) SELECT * FROM b", SqlDialect::MySql);
+    let t = tables(&s.sources);
+    assert_eq!(t.len(), 1, "only real table `t`: {t:?}");
+    assert!(t.iter().any(|(_, _, tbl)| tbl == "t"));
+}
+
+// ===== P0-B: Recursion, forward refs, nesting (T8) =====
+
+#[test]
+fn cte_nested_scope_shadowing() {
+    // Inner query defines its own CTE `x`; outer `x` is shadowed inside.
+    // The inner `x` body references real table `inner_t`.
+    let s = one(
+        "WITH x AS (SELECT * FROM outer_t) SELECT * FROM (WITH x AS (SELECT * FROM inner_t) SELECT * FROM x) AS sub",
+        SqlDialect::MySql,
+    );
+    let t = tables(&s.sources);
+    // outer_t (from outer x's body) + inner_t (from inner x's body)
+    assert!(t.iter().any(|(_, _, tbl)| tbl == "outer_t"), "outer body table: {t:?}");
+    assert!(t.iter().any(|(_, _, tbl)| tbl == "inner_t"), "inner body table: {t:?}");
+}
+
+#[test]
+fn cte_quoted_identifier_case_sensitive() {
+    // Quoted "X" is case-sensitive; unquoted X folds (PG).
+    // Non-recursive: "X" body referencing "X" -> real table "X".
+    let s = one("WITH \"X\" AS (SELECT * FROM \"X\") SELECT * FROM \"X\"", SqlDialect::Postgres);
+    let t = tables(&s.sources);
+    assert!(t.iter().any(|(_, _, tbl)| tbl == "X"), "quoted self-ref -> real table: {t:?}");
+}
