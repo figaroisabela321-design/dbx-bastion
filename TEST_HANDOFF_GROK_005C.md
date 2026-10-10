@@ -21,7 +21,9 @@
 | `d6e4c56cd` | TASK-005D: cookie assertion fix + SQLite file security hardening | 212/212 `dbx-bastion` pass (dev) |
 | `1b9592669` | TASK-005E P0-1: fix CTE shadowing resource bypass in SQL analyzer | 8 new analyzer tests pass (dev) |
 | `660892f78` | TASK-005E P0-2: redesign audit triage with append-only recovery events | 228/228 `dbx-bastion` pass (dev) |
-| *(pending)* | TASK-005E follow-up: inflight lifecycle + recovery state consistency + 0007 | 232/232 `dbx-bastion` pass (dev), awaiting commit |
+| `475f61800` | TASK-005E follow-up: inflight lifecycle + recovery consistency + 0007 | 232/232 `dbx-bastion` pass (dev) |
+| `3aef9644a` | TASK-005E P0-B: fix non-recursive CTE self-reference resource bypass | 8 new tests pass (dev) |
+| `b51d02224` | TASK-005E P0-A: eliminate ABBA deadlock, reliable cleanup, fix fail_closed race | 246/246 `dbx-bastion` pass (dev) |
 
 - **PR:** #1 (Draft) — `feature/bastion-web-firewall` → `main` @ `660892f78`, Grok Bot feedback entry. **Never merge without Kai's explicit approval.**
 - **Upstream:** `t8y2/dbx` (origin) — **never push here.** Work lives on the
