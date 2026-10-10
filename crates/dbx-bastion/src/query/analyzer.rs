@@ -296,11 +296,20 @@ impl<'a> QueryWalker<'a> {
     }
 
     fn is_cte(&self, name: &ObjectName) -> bool {
-        name.0
-            .last()
-            .and_then(|p| Self::part_ident(p).ok())
-            .map(|n| self.cte_names.iter().any(|cte| cte == &n.value.to_uppercase()))
-            .unwrap_or(false)
+        // P0-1: Only a SINGLE-SEGMENT, unqualified name can reference a
+        // CTE. A qualified name (`db.orders`, `schema.orders`) is always
+        // a real table — never a CTE — even if its last segment matches
+        // a CTE name. Treating it as a CTE would skip table-level
+        // authorization (resource identification bypass).
+        if name.0.len() != 1 {
+            return false;
+        }
+        let ident = match Self::part_ident(&name.0[0]) {
+            Ok(i) => i,
+            Err(_) => return false,
+        };
+        let canonical = self.canonical(ident);
+        self.cte_names.iter().any(|cte| cte == &canonical)
     }
 
     fn push_source(&mut self, name: &ObjectName) -> Result<(), AnalyzeError> {
@@ -406,15 +415,24 @@ impl<'a> QueryWalker<'a> {
         if !q.locks.is_empty() {
             self.side_effects = true;
         }
-        // Register CTE names before walking bodies so later CTEs and the
-        // main query resolve them; pop afterwards for correct nesting.
+        // Register CTE names with correct scoping: for each CTE in
+        // order, push its name THEN walk its body. This gives:
+        // - CTE #1's body sees: outer CTEs + itself (recursion)
+        // - CTE #2's body sees: outer CTEs + CTE #1 + itself
+        // - Main query sees: outer CTEs + all CTEs in this WITH clause
+        // A CTE body must NOT see later siblings (SQL forbids forward
+        // references); the old code pushed all names first, letting a
+        // CTE body skip authorization for a real table sharing a later
+        // sibling's name. Pop afterwards for correct nesting.
+        //
+        // Names are stored in canonical form (PG unquoted identifiers
+        // fold to lowercase; quoted are case-sensitive), matching the
+        // comparison in is_cte.
         let mut pushed = 0;
         if let Some(with) = q.with.as_ref() {
             for cte in &with.cte_tables {
-                self.cte_names.push(cte.alias.name.value.to_uppercase());
+                self.cte_names.push(self.canonical(&cte.alias.name));
                 pushed += 1;
-            }
-            for cte in &with.cte_tables {
                 self.walk_query(&cte.query)?;
             }
         }

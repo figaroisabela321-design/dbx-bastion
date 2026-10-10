@@ -609,3 +609,102 @@ fn non_pg_dialects_keep_unqualified_pure_calls() {
     let s = one("SELECT sys.now()", SqlDialect::SqlServer);
     assert!(!s.has_side_effects);
 }
+
+// ---- P0-1: CTE shadowing must not bypass table authorization ---------
+
+// A qualified name (db.table or schema.table) is ALWAYS a real table,
+// even if its last segment matches a CTE name. Only single-segment,
+// unqualified references can be CTEs.
+
+#[test]
+fn mysql_cte_does_not_shadow_qualified_table() {
+    // CTE named `orders`; query references `appdb.orders` (qualified).
+    // The qualified reference must be identified as a real table.
+    let s = one("WITH orders AS (SELECT 1 AS x) SELECT * FROM appdb.orders", SqlDialect::MySql);
+    let t = tables(&s.sources);
+    // MySQL: [db.table] -> database=Present(appdb), schema=N/A
+    assert!(
+        t.iter().any(|(db, _, tbl)| db == &p("appdb") && tbl == "orders"),
+        "qualified table must be a resource: {t:?}"
+    );
+    // The CTE itself is not a resource; only the real table is.
+    assert_eq!(t.len(), 1, "only the qualified real table: {t:?}");
+}
+
+#[test]
+fn postgres_cte_does_not_shadow_qualified_table() {
+    // PG: unquoted identifiers fold to lowercase.
+    let s = one("WITH orders AS (SELECT 1 AS x) SELECT * FROM public.orders", SqlDialect::Postgres);
+    let t = tables(&s.sources);
+    assert!(
+        t.iter().any(|(_, schema, tbl)| schema == &p("public") && tbl == "orders"),
+        "qualified table must be a resource: {t:?}"
+    );
+    assert_eq!(t.len(), 1);
+}
+
+#[test]
+fn generic_cte_does_not_shadow_qualified_table() {
+    let s = one("WITH orders AS (SELECT 1 AS x) SELECT * FROM mydb.public.orders", SqlDialect::Generic);
+    let t = tables(&s.sources);
+    assert!(
+        t.iter().any(|(db, schema, tbl)| db == &p("mydb") && schema == &p("public") && tbl == "orders"),
+        "three-part qualified table must be a resource: {t:?}"
+    );
+    assert_eq!(t.len(), 1);
+}
+
+#[test]
+fn postgres_cte_case_folding() {
+    // Unquoted CTE name folds to lowercase; reference must match.
+    let s = one("WITH Orders AS (SELECT 1 AS x) SELECT * FROM Orders", SqlDialect::Postgres);
+    assert!(s.sources.is_empty(), "CTE reference (folded) is not a resource: {:?}", s.sources);
+
+    // Quoted "Orders" is case-sensitive and distinct from unquoted orders.
+    let s = one("WITH \"Orders\" AS (SELECT 1 AS x) SELECT * FROM \"Orders\"", SqlDialect::Postgres);
+    assert!(s.sources.is_empty(), "quoted CTE reference is not a resource: {:?}", s.sources);
+
+    // Quoted "Orders" does NOT match unquoted CTE `orders`.
+    let s = one("WITH orders AS (SELECT 1 AS x) SELECT * FROM \"Orders\"", SqlDialect::Postgres);
+    let t = tables(&s.sources);
+    assert_eq!(t.len(), 1, "quoted \"Orders\" != CTE orders, must be a resource: {t:?}");
+    assert_eq!(t[0].2, "Orders");
+}
+
+#[test]
+fn normal_cte_reference_is_not_a_resource() {
+    // Plain CTE usage: no real tables involved.
+    let s = one("WITH recent AS (SELECT 1 AS x) SELECT * FROM recent", SqlDialect::MySql);
+    assert!(s.sources.is_empty(), "pure CTE reference must not produce resources");
+}
+
+#[test]
+fn nested_cte_scoping() {
+    // Inner query defines its own CTE; outer CTE still visible.
+    let s = one(
+        "WITH outer_cte AS (SELECT 1 AS x) SELECT * FROM outer_cte WHERE x IN (WITH inner_cte AS (SELECT 2 AS y) SELECT y FROM inner_cte)",
+        SqlDialect::MySql,
+    );
+    assert!(s.sources.is_empty(), "nested CTEs must not produce resources: {:?}", s.sources);
+}
+
+#[test]
+fn cte_forward_reference_does_not_hide_real_table() {
+    // CTE `a`'s body references `b`, but `b` is defined LATER.
+    // SQL forbids forward references, so `b` inside `a`'s body must be
+    // treated as a REAL TABLE (not the later CTE).
+    let s = one("WITH a AS (SELECT * FROM b), b AS (SELECT 1 AS x) SELECT * FROM a", SqlDialect::MySql);
+    let t = tables(&s.sources);
+    assert!(t.iter().any(|(_, _, tbl)| tbl == "b"), "`b` in `a`'s body is a forward reference -> real table: {t:?}");
+}
+
+#[test]
+fn same_name_cte_and_real_table_coexist() {
+    // Unqualified `orders` -> CTE (skipped). Qualified `appdb.orders`
+    // -> real table (resource). Both in one query.
+    let s =
+        one("WITH orders AS (SELECT 1 AS x) SELECT * FROM orders JOIN appdb.orders AS o2 ON true", SqlDialect::MySql);
+    let t = tables(&s.sources);
+    assert_eq!(t.len(), 1, "only the qualified real table: {t:?}");
+    assert!(t.iter().any(|(db, _, tbl)| db == &p("appdb") && tbl == "orders"));
+}
