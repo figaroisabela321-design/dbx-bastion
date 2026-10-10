@@ -62,12 +62,14 @@ impl SqliteStore {
     /// Open the bastion database at `path`, creating parent directories and
     /// the file if needed, then apply pending migrations.
     ///
-    /// Directory security (TASK-005D): the parent directory is created
-    /// with `0700` at creation time (never 0755-then-chmod) or, if it
-    /// already exists, validated (ownership / permissions / symlinks /
-    /// parent) and refused when insecure — never silently repaired.
-    /// The database file is pre-created with `0600` before SQLite opens
-    /// it. Non-Unix platforms are refused.
+    /// File security (TASK-005D): the parent directory is created with
+    /// `0700` at creation time (never 0755-then-chmod) or, if it already
+    /// exists, validated and refused when insecure — never silently
+    /// repaired. An existing database file is validated BEFORE SQLite
+    /// opens it: symlinks and non-regular files are rejected, ownership
+    /// and `0600`-or-stricter permissions are checked, and an
+    /// `O_NOFOLLOW` open guards the validation→open window. New files
+    /// are pre-created with `0600`. Non-Unix platforms are refused.
     ///
     /// Synchronous by design: call once at startup (wrap in
     /// `spawn_blocking` at the call site if already inside async code).
@@ -78,17 +80,22 @@ impl SqliteStore {
                 crate::secure_dir::ensure_secure_dir(parent)?;
             }
         }
-        // Pre-create the file with 0600 so it never exists with looser
-        // permissions (no create-then-chmod window).
-        crate::secure_dir::precreate_secure_file(path)?;
+        // Existing file: validate type/ownership/permissions BEFORE
+        // SQLite touches it, then guard the TOCTOU window with
+        // O_NOFOLLOW. New file: pre-create with 0600.
+        let exists = std::fs::symlink_metadata(path).is_ok();
+        if exists {
+            crate::secure_dir::validate_existing_file(path, "bastion database")?;
+            crate::secure_dir::nofollow_open_check(path, "bastion database")?;
+        } else {
+            crate::secure_dir::precreate_secure_file(path)?;
+        }
 
         let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         apply_migrations(&mut conn)?;
-        // Idempotent hardening for files created before precreate existed.
-        restrict_file_permissions(path)?;
 
         Ok(Self { conn: Arc::new(Mutex::new(conn)), path: path.to_path_buf() })
     }
@@ -164,25 +171,6 @@ impl SqliteStore {
         .await
         .map_err(|error| BastionError::StorageTask(format!("storage task join failed: {error}")))?
     }
-}
-
-/// Tighten the database file to owner-only access (Unix). The bastion
-/// database holds password hashes and session token hashes; group/other
-/// must not read it. Applied on every open (idempotent) so files created
-/// before this hardening are fixed too.
-fn restrict_file_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
-            BastionError::Migration(format!("cannot restrict permissions on {}: {error}", path.display()))
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
 }
 
 /// Apply every migration in [`MIGRATIONS`] that is not yet recorded in

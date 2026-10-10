@@ -162,7 +162,7 @@ fn current_uid() -> u32 {
 /// permissions. Existing files are left untouched (validated
 /// elsewhere, never repaired).
 #[cfg(unix)]
-pub(crate) fn precreate_secure_file(path: &Path) -> Result<()> {
+pub fn precreate_secure_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
@@ -173,8 +173,107 @@ pub(crate) fn precreate_secure_file(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn precreate_secure_file(path: &Path) -> Result<()> {
+pub fn precreate_secure_file(path: &Path) -> Result<()> {
     let _ = path;
+    Err(BastionError::Migration("bastion file security requires Unix; refusing".to_string()))
+}
+
+/// Validate an existing database file BEFORE SQLite opens it.
+/// Rejects symlinks, non-regular files, wrong ownership, and insecure
+/// permissions. Never repairs: an untrusted old file is refused with
+/// a diagnosable error.
+#[cfg(unix)]
+pub(crate) fn validate_existing_file(path: &Path, what: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| BastionError::Migration(format!("cannot stat {what} {}: {e}", path.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(BastionError::Migration(format!(
+            "{what} {} is a symlink; refusing to follow untrusted links",
+            path.display()
+        )));
+    }
+    if !meta.file_type().is_file() {
+        return Err(BastionError::Migration(format!("{what} {} is not a regular file; refusing", path.display())));
+    }
+    let euid = current_uid();
+    if meta.uid() != euid {
+        return Err(BastionError::Migration(format!(
+            "{what} {} is owned by uid {} (expected euid {euid}); refusing",
+            path.display(),
+            meta.uid()
+        )));
+    }
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(BastionError::Migration(format!(
+            "{what} {} has insecure permissions {mode:04o}; require 0600 or stricter. \
+             Permissions are not repaired automatically",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn validate_existing_file(path: &Path, what: &str) -> Result<()> {
+    let _ = (path, what);
+    Err(BastionError::Migration("bastion file security requires Unix; refusing".to_string()))
+}
+
+/// Anti-TOCTOU guard: open an existing file with `O_NOFOLLOW` so a
+/// symlink swap between validation and the SQLite open fails instead
+/// of being followed. The parent directory is already `0700`/
+/// euid-owned at this point, so no other user can swap the file —
+/// this is defense in depth for the check→open window.
+///
+/// Returns `Ok(())` when the file does not exist (caller will create
+/// it securely).
+#[cfg(unix)]
+pub(crate) fn nofollow_open_check(path: &Path, what: &str) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let file = match std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOFOLLOW).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // ELOOP or any other open failure: refuse.
+        Err(e) => {
+            return Err(BastionError::Migration(format!(
+                "{what} {} cannot be opened without following symlinks ({e}); refusing",
+                path.display()
+            )))
+        }
+    };
+    // Confirm via fstat on the open fd: must still be a regular file
+    // owned by euid (the fd cannot be swapped under us).
+    let fd = file.as_raw_fd();
+    let stat: libc::stat = unsafe {
+        let mut s = std::mem::zeroed();
+        if libc::fstat(fd, &mut s) != 0 {
+            return Err(BastionError::Migration(format!("{what} {}: fstat failed; refusing", path.display())));
+        }
+        s
+    };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(BastionError::Migration(format!(
+            "{what} {} is not a regular file (fstat); refusing",
+            path.display()
+        )));
+    }
+    if stat.st_uid != current_uid() {
+        return Err(BastionError::Migration(format!(
+            "{what} {} changed ownership after validation; refusing",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn nofollow_open_check(path: &Path, what: &str) -> Result<()> {
+    let _ = (path, what);
     Err(BastionError::Migration("bastion file security requires Unix; refusing".to_string()))
 }
 
@@ -252,5 +351,67 @@ mod tests {
         assert_eq!(mode, 0o600, "new db file must be 0600");
         // Idempotent: existing file is left alone.
         precreate_secure_file(&file).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_symlink_file_is_rejected() {
+        let base = unique_base("symlink-file");
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("real.db");
+        std::fs::write(&target, b"sqlite").unwrap();
+        let link = base.join("bastion.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = validate_existing_file(&link, "bastion database").unwrap_err();
+        assert!(err.to_string().contains("symlink"), "unexpected: {err}");
+        // The O_NOFOLLOW guard also rejects it.
+        let err = nofollow_open_check(&link, "bastion database").unwrap_err();
+        assert!(err.to_string().contains("symlink") || err.to_string().contains("ELOOP"), "unexpected: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_insecure_file_is_rejected_not_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = unique_base("insecure-file");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("bastion.db");
+        std::fs::write(&file, b"sqlite").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = validate_existing_file(&file, "bastion database").unwrap_err();
+        assert!(err.to_string().contains("insecure permissions"), "unexpected: {err}");
+
+        // Not silently repaired: still 0644.
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_secure_file_passes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = unique_base("secure-file");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("bastion.db");
+        std::fs::write(&file, b"sqlite").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        validate_existing_file(&file, "bastion database").unwrap();
+        nofollow_open_check(&file, "bastion database").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_file_is_rejected() {
+        let base = unique_base("dir-as-file");
+        let dir_as_file = base.join("bastion.db");
+        std::fs::create_dir_all(&dir_as_file).unwrap();
+
+        let err = validate_existing_file(&dir_as_file, "bastion database").unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "unexpected: {err}");
     }
 }

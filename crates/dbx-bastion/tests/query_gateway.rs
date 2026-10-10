@@ -40,6 +40,8 @@ fn temp_db_path(tag: &str) -> PathBuf {
     let path =
         std::env::temp_dir().join(format!("dbx-bastion-gw-test-{}-{}-{}", std::process::id(), n, tag)).join("test.db");
     dbx_bastion::secure_dir::ensure_secure_dir(path.parent().unwrap()).unwrap();
+    // Pre-create the file with 0600 for tests using rusqlite directly.
+    dbx_bastion::secure_dir::precreate_secure_file(&path).unwrap();
     path
 }
 

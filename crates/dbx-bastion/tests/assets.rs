@@ -36,6 +36,8 @@ fn temp_db_path(tag: &str) -> PathBuf {
         .join(format!("dbx-bastion-assets-test-{}-{}-{}", std::process::id(), n, tag))
         .join("test.db");
     dbx_bastion::secure_dir::ensure_secure_dir(path.parent().unwrap()).unwrap();
+    // Pre-create the file with 0600 for tests using rusqlite directly.
+    dbx_bastion::secure_dir::precreate_secure_file(&path).unwrap();
     path
 }
 
@@ -854,6 +856,14 @@ async fn migration_0002_to_0003_upgrade() {
     }
 
     // Opening applies 0003 and 0004 on top of the 0002 database.
+    // The direct rusqlite open above created the file with umask
+    // permissions; this test simulates a compliant legacy DB, so
+    // tighten to 0600 before SqliteStore::open validates it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let service = BastionService::open(&db_path).expect("open applies 0003+0004");
     let store = service.store().clone();
 

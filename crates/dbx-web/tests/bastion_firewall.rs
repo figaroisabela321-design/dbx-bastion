@@ -756,7 +756,17 @@ async fn insecure_cookie_dev_mode_login_me_logout() {
     // Must use the non-__Host- name (browsers reject __Host- without Secure).
     assert!(set_cookie.starts_with("bastion-session-insecure="), "unexpected Set-Cookie: {set_cookie}");
     assert!(!set_cookie.contains("__Host-"), "must not use __Host- prefix without Secure");
-    assert!(!set_cookie.to_lowercase().contains("secure"), "dev cookie must not claim Secure");
+    // Parse the semicolon-separated attributes and check for a
+    // standalone `Secure` attribute. (The cookie NAME itself contains
+    // "insecure", so a substring search would be wrong.)
+    let has_secure_attr = set_cookie
+        .split(';')
+        .skip(1) // skip the name=value pair
+        .any(|attr| attr.trim().eq_ignore_ascii_case("secure"));
+    assert!(!has_secure_attr, "dev cookie must not have the Secure attribute: {set_cookie}");
+    // HttpOnly and Path=/ must still be present.
+    let has_httponly = set_cookie.split(';').skip(1).any(|attr| attr.trim().eq_ignore_ascii_case("httponly"));
+    assert!(has_httponly, "dev cookie must keep HttpOnly: {set_cookie}");
     let session_cookie = set_cookie.split(';').next().unwrap().to_string();
 
     // Authenticated request with the cookie: /auth/me works.

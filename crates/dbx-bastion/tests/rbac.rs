@@ -44,6 +44,8 @@ fn temp_db_path(tag: &str) -> PathBuf {
         .join(format!("dbx-bastion-rbac-test-{}-{}-{}", std::process::id(), n, tag))
         .join("test.db");
     dbx_bastion::secure_dir::ensure_secure_dir(path.parent().unwrap()).unwrap();
+    // Pre-create the file with 0600 for tests using rusqlite directly.
+    dbx_bastion::secure_dir::precreate_secure_file(&path).unwrap();
     path
 }
 
@@ -1119,7 +1121,14 @@ async fn migration_0004_upgrade_preserves_data() {
         .unwrap();
     }
 
-    let service = BastionService::open(&db_path).expect("upgrade to 0004");
+    let service = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        BastionService::open(&db_path).expect("upgrade to 0004")
+    };
     // The grant survived the table rebuild with its scope intact.
     let grants = GrantService::new(service.store().clone(), test_clock());
     // Bootstrap an admin to read grants.
@@ -1167,6 +1176,11 @@ fn migration_0004_aborts_on_null_scope() {
     }
 
     // The upgrade refuses to silently broaden the grant: open fails...
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let err = match BastionService::open(&db_path) {
         Ok(_) => panic!("open must fail on NULL-scope historical grants"),
         Err(err) => err,

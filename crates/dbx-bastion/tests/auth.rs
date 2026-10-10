@@ -35,6 +35,8 @@ fn temp_db_path(tag: &str) -> PathBuf {
         .join("test.db");
     // Ensure the parent exists (securely) for tests using rusqlite directly.
     dbx_bastion::secure_dir::ensure_secure_dir(path.parent().unwrap()).unwrap();
+    // Pre-create the file with 0600 for tests using rusqlite directly.
+    dbx_bastion::secure_dir::precreate_secure_file(&path).unwrap();
     path
 }
 
