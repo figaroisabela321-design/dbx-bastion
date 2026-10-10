@@ -16,7 +16,14 @@
 | `387b9c730` | TASK-005C-2: Bastion Session + Asset/Connection Adapter | code complete, `cargo check` clean |
 | `9b062ccc3` | TASK-005C-3: Real DBX QueryExecutor | code complete, `cargo check` clean |
 | `7851b1ec6` | TASK-005C-4: QueryGateway HTTP API + controlled audit recovery | code complete, `cargo check` clean |
+| `ddbd24f00` | TASK-005D: secure dir (0700 at mkdir) + 0600 db pre-create | `dbx-bastion` tests pass |
+| `1166b808d` | TASK-005D: insecure dev cookie rename | `dbx-bastion` tests pass |
+| `d6e4c56cd` | TASK-005D: cookie assertion fix + SQLite file security hardening | 212/212 `dbx-bastion` pass (dev) |
+| `1b9592669` | TASK-005E P0-1: fix CTE shadowing resource bypass in SQL analyzer | 8 new analyzer tests pass (dev) |
+| `660892f78` | TASK-005E P0-2: redesign audit triage with append-only recovery events | 228/228 `dbx-bastion` pass (dev) |
+| *(pending)* | TASK-005E follow-up: inflight lifecycle + recovery state consistency + 0007 | 232/232 `dbx-bastion` pass (dev), awaiting commit |
 
+- **PR:** #1 (Draft) — `feature/bastion-web-firewall` → `main` @ `660892f78`, Grok Bot feedback entry. **Never merge without Kai's explicit approval.**
 - **Upstream:** `t8y2/dbx` (origin) — **never push here.** Work lives on the
   feature branch; PR target is the private fork when available.
 

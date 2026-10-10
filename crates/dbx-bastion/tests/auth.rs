@@ -563,7 +563,8 @@ async fn migration_0001_to_0002_upgrade_idempotent() {
                 "0003_assets".to_string(),
                 "0004_rbac".to_string(),
                 "0005_audit".to_string(),
-                "0006_audit_recovery".to_string()
+                "0006_audit_recovery".to_string(),
+                "0007_audit_recovery_followup".to_string()
             ]
         );
     }
@@ -572,7 +573,7 @@ async fn migration_0001_to_0002_upgrade_idempotent() {
     let _service = BastionService::open(&db_path).unwrap();
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0)).unwrap();
-    assert_eq!(count, 6);
+    assert_eq!(count, 7);
     let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0)).unwrap();
     assert_eq!(sessions, 1);
 }

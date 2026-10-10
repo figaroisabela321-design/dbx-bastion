@@ -905,7 +905,15 @@ fn migration_idempotent_and_failed_migration_rolls_back() {
         .collect();
     assert_eq!(
         versions,
-        vec!["0001_init", "0002_auth", "0003_assets", "0004_rbac", "0005_audit", "0006_audit_recovery"]
+        vec![
+            "0001_init",
+            "0002_auth",
+            "0003_assets",
+            "0004_rbac",
+            "0005_audit",
+            "0006_audit_recovery",
+            "0007_audit_recovery_followup"
+        ]
     );
 
     // A failing migration records nothing and leaves no partial schema.

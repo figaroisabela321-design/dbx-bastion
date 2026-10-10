@@ -74,7 +74,33 @@ pub struct QueryGateway {
     /// set (orphaned by a crash/restart). V1 is single-process per
     /// audit store; concurrent queries in one process never block
     /// each other.
-    inflight: Mutex<HashSet<Uuid>>,
+    ///
+    /// Registration happens immediately after `record_started` commits
+    /// (see `InflightGuard`); the triage path locks this mutex for its
+    /// check+INSERT, so a query starting concurrently cannot slip
+    /// through. Wrapped in Arc so the HTTP handler can share ownership
+    /// without lifetime issues.
+    inflight: Arc<tokio::sync::Mutex<HashSet<Uuid>>>,
+}
+
+/// RAII guard: removes the audit ID from the in-flight set on drop.
+/// Covers every exit path (success, error, panic, async cancellation)
+/// so an active STARTED is never mistaken for an orphan.
+struct InflightGuard {
+    inflight: Arc<tokio::sync::Mutex<HashSet<Uuid>>>,
+    id: Uuid,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        // try_lock: Drop runs in async context (task abort/cancel), where
+        // blocking_lock() would panic. If the lock is contended (triage
+        // holding it briefly), the ID may leak; the leak is fail-closed
+        // (triage of a terminal row is rejected anyway by the status check).
+        if let Ok(mut guard) = self.inflight.try_lock() {
+            guard.remove(&self.id);
+        }
+    }
 }
 
 impl QueryGateway {
@@ -93,7 +119,7 @@ impl QueryGateway {
             clock,
             pre_execute_hook: Mutex::new(None),
             fail_closed: AtomicBool::new(false),
-            inflight: Mutex::new(HashSet::new()),
+            inflight: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -124,7 +150,7 @@ impl QueryGateway {
             .list_unfinished()
             .await
             .map_err(|e| BastionError::AuditUnavailable(format!("audit unavailable: {e}")))?;
-        let inflight = self.inflight.lock().unwrap();
+        let inflight = self.inflight.lock().await;
         let interrupted =
             unfinished.iter().any(|u| !matches!(u.status, AuditStatus::Started) || !inflight.contains(&u.id));
         drop(inflight);
@@ -147,7 +173,14 @@ impl QueryGateway {
     /// with this audit ID. Triage of in-flight records is forbidden
     /// (P0-2): only orphaned interruptions may be triaged.
     pub fn is_inflight(&self, audit_id: &uuid::Uuid) -> bool {
-        self.inflight.lock().unwrap().contains(audit_id)
+        self.inflight.try_lock().map(|g| g.contains(audit_id)).unwrap_or(true)
+    }
+
+    /// The live in-flight set, for the triage path. The audit service
+    /// locks this mutex for its check+INSERT, closing the race between
+    /// the HTTP-layer check and the DB commit.
+    pub fn inflight_set(&self) -> Arc<tokio::sync::Mutex<HashSet<Uuid>>> {
+        self.inflight.clone()
     }
 
     fn dialect_for(db_type: &str) -> SqlDialect {
@@ -331,11 +364,22 @@ impl QueryGateway {
         }
 
         // 8. Audit STARTED must commit before the executor is touched.
+        //     The inflight lock is held across record_started + insert:
+        //     triage cannot slip in between and treat this new row as an
+        //     orphan. (tokio MutexGuard is Send, safe across await.)
         let event = self.audit_event(principal, asset.id, stmt, &sql, &hash, Some("allow".to_string()));
+        let mut _inflight_lock = self.inflight.lock().await;
         let audit_id = self.audit.record_started(event).await.map_err(|e| {
             // No audit event exists: the executor must see zero calls.
+            // (No inflight registration: the STARTED row does not exist.)
             BastionError::AuditUnavailable(e.to_string())
         })?;
+        // 8b. Register in-flight while holding the lock. The guard removes
+        //     the ID on drop, covering every exit path: success, error,
+        //     panic, async cancellation.
+        _inflight_lock.insert(audit_id);
+        drop(_inflight_lock);
+        let _inflight_guard = InflightGuard { inflight: self.inflight.clone(), id: audit_id };
 
         // 9. Deterministic test hook: revoke/disable mid-flight here.
         //     The hook is taken out of the lock before awaiting.
@@ -449,13 +493,12 @@ impl QueryGateway {
         }
     }
 
-    /// Record a terminal audit outcome and release the in-flight
-    /// registration. A failed write latches fail-closed: an executed
-    /// statement with no audit record is the worst outcome, and we
-    /// never claim the database operation was rolled back.
+    /// Record a terminal audit outcome. A failed write latches fail-closed:
+    /// an executed statement with no audit record is the worst outcome,
+    /// and we never claim the database operation was rolled back.
+    /// (In-flight deregistration is handled by `InflightGuard`.)
     async fn finish_audit(&self, audit_id: Uuid, outcome: AuditOutcome) -> Result<()> {
         let write_failed = self.audit.record_finished(audit_id, outcome).await.is_err();
-        self.inflight.lock().unwrap().remove(&audit_id);
         if write_failed {
             self.fail_closed.store(true, Ordering::SeqCst);
             return Err(BastionError::AuditFailClosed);

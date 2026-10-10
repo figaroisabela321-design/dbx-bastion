@@ -38,6 +38,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0004_rbac", include_str!("../migrations/0004_rbac.sql")),
     ("0005_audit", include_str!("../migrations/0005_audit.sql")),
     ("0006_audit_recovery", include_str!("../migrations/0006_audit_recovery.sql")),
+    ("0007_audit_recovery_followup", include_str!("../migrations/0007_audit_recovery_followup.sql")),
 ];
 
 /// SQLITE_CONSTRAINT_UNIQUE extended error code.
@@ -107,7 +108,7 @@ impl SqliteStore {
     }
 
     /// Run a blocking rusqlite closure without stalling the async executor.
-    pub(crate) async fn blocking<F, T>(&self, f: F) -> Result<T>
+    pub async fn blocking<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,

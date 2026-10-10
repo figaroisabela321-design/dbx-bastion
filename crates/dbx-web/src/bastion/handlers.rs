@@ -324,18 +324,19 @@ pub async fn triage_interruption(
                 .into_response()
         }
     };
-    // Forbid triage of actively-executing records (P0-2 requirement 6).
-    // The gateway tracks in-flight audit IDs; the instance lock
-    // guarantees this process is the only writer.
+    // Triage with race-free in-flight protection (Issue 3): the service
+    // locks the gateway's live set for its check+INSERT. The early
+    // is_inflight check is a fast-path; the service-level lock is the
+    // authoritative guard.
     if let Some(gw) = state.gateway.as_ref() {
         if gw.is_inflight(&record_id) {
             return (StatusCode::CONFLICT, "audit record is actively executing; triage is forbidden").into_response();
         }
     }
-    // Pass an empty set: the gateway check above already rejected
-    // in-flight IDs. The service also guards against in-flight IDs
-    // passed by other callers (defense in depth).
-    let inflight_set = std::collections::HashSet::new();
+    let inflight: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<uuid::Uuid>>> =
+        state.gateway.as_ref().map(|gw| gw.inflight_set()).unwrap_or_else(|| {
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<uuid::Uuid>::new()))
+        });
     let audit = dbx_bastion::audit::SqliteAuditService::new(state.service.store().clone());
     match audit
         .triage_interruption(
@@ -344,7 +345,7 @@ pub async fn triage_interruption(
             &body.reason,
             body.evidence.as_deref().unwrap_or(""),
             conclusion,
-            &inflight_set,
+            inflight,
         )
         .await
     {

@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use uuid::Uuid;
@@ -774,14 +774,23 @@ async fn triage_confirmed_committed_preserves_original() {
             "DBA confirmed the transaction committed",
             "binlog shows COMMIT at 2026-10-10T10:00:00Z",
             TriageConclusion::ConfirmedCommitted,
-            &HashSet::new(),
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap();
 
-    // Original row is NOT modified: status stays `started`, not `failed`.
-    let unfinished = audit.list_unfinished().await.unwrap();
-    assert!(unfinished.iter().any(|u| u.id == id && u.status == AuditStatus::Started));
+    // Original row is NOT modified in the DB: status stays `started`,
+    // not `failed`. (list_unfinished filters confirmed records by design.)
+    // We verify via a direct DB read through the store.
+    let store = audit.store();
+    let status: String = store
+        .blocking(move |conn| {
+            conn.query_row("SELECT status FROM audit_events WHERE id = ?1", [id.to_string()], |row| row.get(0))
+                .map_err(dbx_bastion::error::BastionError::Storage)
+        })
+        .await
+        .unwrap();
+    assert_eq!(status, "started", "original audit row must not be modified");
 
     // Recovery event exists with the conclusion.
     let recovery = audit.get_recovery_event(id).await.unwrap().expect("recovery event");
@@ -790,6 +799,8 @@ async fn triage_confirmed_committed_preserves_original() {
 
     // Execution is unblocked (has_untriaged_interruptions = false).
     assert!(!audit.has_untriaged_interruptions().await.unwrap());
+    // And the confirmed record is not listed as unfinished.
+    assert!(audit.list_unfinished().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -806,7 +817,7 @@ async fn triage_still_unknown_keeps_block() {
             "Cannot determine outcome from logs",
             "",
             TriageConclusion::StillUnknown,
-            &HashSet::new(),
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap();
@@ -826,18 +837,11 @@ async fn triage_inflight_started_rejected() {
     let id = event.id;
     audit.record_started(event).await.unwrap();
 
-    let mut inflight = HashSet::new();
-    inflight.insert(id);
+    let inflight = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    inflight.lock().await.insert(id);
 
     let err = audit
-        .triage_interruption(
-            id,
-            Uuid::new_v4(),
-            "reason",
-            "evidence",
-            TriageConclusion::ConfirmedNotExecuted,
-            &inflight,
-        )
+        .triage_interruption(id, Uuid::new_v4(), "reason", "evidence", TriageConclusion::ConfirmedNotExecuted, inflight)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("actively executing"), "unexpected: {err}");
@@ -855,10 +859,18 @@ async fn triage_duplicate_rejected() {
     audit.record_started(event).await.unwrap();
 
     audit
-        .triage_interruption(id, Uuid::new_v4(), "first", "e1", TriageConclusion::ConfirmedNotExecuted, &HashSet::new())
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "first",
+            "e1",
+            TriageConclusion::ConfirmedNotExecuted,
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
         .await
         .unwrap();
 
+    // Confirmed conclusions are irreversible.
     let err = audit
         .triage_interruption(
             id,
@@ -866,11 +878,97 @@ async fn triage_duplicate_rejected() {
             "second",
             "e2",
             TriageConclusion::ConfirmedNotExecuted,
-            &HashSet::new(),
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("already been triaged"), "unexpected: {err}");
+    assert!(err.to_string().contains("irreversible"), "unexpected: {err}");
+}
+
+#[tokio::test]
+async fn triage_still_unknown_can_be_followed_up() {
+    // Issue 2: still_unknown -> blocked -> evidence -> confirmed_* -> unblocked.
+    // History is preserved (append-only).
+    let audit = triage_audit();
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    // First: still_unknown (no evidence yet).
+    audit
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "logs inconclusive",
+            "",
+            TriageConclusion::StillUnknown,
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
+        .await
+        .unwrap();
+    assert!(audit.has_untriaged_interruptions().await.unwrap(), "still_unknown keeps blocking");
+
+    // Later: DBA finds proof, appends confirmed_committed.
+    audit
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "DBA confirmed via binlog",
+            "binlog COMMIT at 2026-10-10T10:00:00Z",
+            TriageConclusion::ConfirmedCommitted,
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
+        .await
+        .unwrap();
+
+    // Unblocked now.
+    assert!(!audit.has_untriaged_interruptions().await.unwrap());
+
+    // History preserved: two events, oldest first.
+    let history = audit.list_recovery_events(id).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].conclusion, TriageConclusion::StillUnknown);
+    assert_eq!(history[1].conclusion, TriageConclusion::ConfirmedCommitted);
+
+    // Original audit row untouched.
+    let unfinished = audit.list_unfinished().await.unwrap();
+    assert!(unfinished.is_empty(), "confirmed record is not listed as unfinished");
+}
+
+#[tokio::test]
+async fn triage_confirmed_cannot_be_reversed() {
+    let audit = triage_audit();
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    audit
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "confirmed",
+            "proof",
+            TriageConclusion::ConfirmedCommitted,
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
+        .await
+        .unwrap();
+
+    // Cannot "re-triage" to still_unknown to re-block, nor to another conclusion.
+    for conclusion in [TriageConclusion::StillUnknown, TriageConclusion::ConfirmedNotExecuted] {
+        let err = audit
+            .triage_interruption(
+                id,
+                Uuid::new_v4(),
+                "try reverse",
+                "e",
+                conclusion,
+                Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("irreversible"), "unexpected: {err}");
+    }
 }
 
 #[tokio::test]
@@ -882,14 +980,28 @@ async fn triage_requires_reason_and_evidence_for_confirmed() {
 
     // Empty reason rejected.
     let err = audit
-        .triage_interruption(id, Uuid::new_v4(), "  ", "e", TriageConclusion::ConfirmedNotExecuted, &HashSet::new())
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "  ",
+            "e",
+            TriageConclusion::ConfirmedNotExecuted,
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("reason is required"));
 
     // confirmed_* without evidence rejected.
     let err = audit
-        .triage_interruption(id, Uuid::new_v4(), "reason", "", TriageConclusion::ConfirmedCommitted, &HashSet::new())
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "reason",
+            "",
+            TriageConclusion::ConfirmedCommitted,
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("requires evidence"));
@@ -904,7 +1016,14 @@ async fn triage_rejects_overlong_inputs() {
 
     let long_reason = "x".repeat(2001);
     let err = audit
-        .triage_interruption(id, Uuid::new_v4(), &long_reason, "e", TriageConclusion::StillUnknown, &HashSet::new())
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            &long_reason,
+            "e",
+            TriageConclusion::StillUnknown,
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("exceeds"));
@@ -917,7 +1036,7 @@ async fn triage_rejects_overlong_inputs() {
             "reason",
             &long_evidence,
             TriageConclusion::StillUnknown,
-            &HashSet::new(),
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         )
         .await
         .unwrap_err();
@@ -946,7 +1065,14 @@ async fn triage_terminal_record_rejected() {
         .unwrap();
 
     let err = audit
-        .triage_interruption(id, Uuid::new_v4(), "reason", "e", TriageConclusion::StillUnknown, &HashSet::new())
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "reason",
+            "e",
+            TriageConclusion::StillUnknown,
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("already terminal"));
@@ -991,4 +1117,130 @@ async fn gateway_cte_does_not_bypass_table_deny() {
     );
     // The executor must not have been called.
     assert_eq!(gw.executor.calls(), 0, "denied query must not reach the executor");
+}
+
+// ---- Issue 1: full lifecycle ------------------------------------------
+
+#[tokio::test]
+async fn lifecycle_orphaned_started_to_ready() {
+    // Orphaned STARTED -> DEGRADED (blocked) -> confirmed_* -> still
+    // blocked until controlled restart -> READY.
+    //
+    // Note: the gateway's fail_closed latch is in-memory. After triage,
+    // a NEW gateway instance (simulating controlled restart) must not
+    // be blocked by the confirmed record.
+    let db_path = temp_db_path("lifecycle");
+    let _ = std::fs::remove_file(&db_path);
+    let service = BastionService::open(&db_path).unwrap();
+    let store = service.store().clone();
+    let audit = SqliteAuditService::new(store.clone());
+
+    // Simulate an orphaned STARTED (e.g. crash before finish).
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    // DEGRADED: blocked.
+    assert!(audit.has_untriaged_interruptions().await.unwrap());
+    assert_eq!(audit.list_unfinished().await.unwrap().len(), 1);
+
+    // Triage as confirmed_not_executed with evidence.
+    audit
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "verified never executed",
+            "DBA checked: no such transaction in logs",
+            TriageConclusion::ConfirmedNotExecuted,
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
+        .await
+        .unwrap();
+
+    // No longer blocking.
+    assert!(!audit.has_untriaged_interruptions().await.unwrap());
+    assert!(audit.list_unfinished().await.unwrap().is_empty());
+
+    // still_unknown keeps blocking (separate record).
+    let event2 = started_event();
+    let id2 = event2.id;
+    audit.record_started(event2).await.unwrap();
+    audit
+        .triage_interruption(
+            id2,
+            Uuid::new_v4(),
+            "inconclusive",
+            "",
+            TriageConclusion::StillUnknown,
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
+        .await
+        .unwrap();
+    assert!(audit.has_untriaged_interruptions().await.unwrap());
+    assert_eq!(audit.list_unfinished().await.unwrap().len(), 1);
+}
+
+// ---- Issue 3: inflight lifecycle --------------------------------------
+
+#[tokio::test]
+async fn concurrent_query_not_blocked_by_inflight() {
+    // Issue 3 requirement: "查询 A 处于执行中时，查询 B 不应错误触发全局 DEGRADED".
+    // A hangs in execution (in-flight). B must execute normally, not
+    // be refused due to A's STARTED row.
+    //
+    // Single gateway (V1 model: one gateway per process). A and B share
+    // the gateway's inflight set.
+    use std::sync::Arc;
+    let gw = Gw::new("inflight-conc").await;
+    // The Gw's gateway uses FlakyAudit; we need the raw audit for
+    // polling. Share the store.
+    let gateway = Arc::new(QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(SqliteAuditService::new(gw.service.store().clone())) as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    ));
+    gw.executor.set_behavior(MockBehavior::Hang);
+
+    // Start A (hanging).
+    let gw_a = gateway.clone();
+    let user_a = gw.user.clone();
+    let asset_id = gw.asset_id;
+    let handle_a = tokio::spawn(async move {
+        let req = GatewayRequest {
+            asset_id,
+            sql: "SELECT * FROM appdb.orders WHERE id = 1".to_string(),
+            options: ExecutionOptions::default(),
+        };
+        let _ = gw_a.execute(&user_a, req).await;
+    });
+
+    // Wait for A's STARTED + inflight registration.
+    let audit = SqliteAuditService::new(gw.service.store().clone());
+    let mut saw_started = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let unfinished = audit.list_unfinished().await.unwrap();
+        if unfinished.iter().any(|u| u.status == AuditStatus::Started) {
+            saw_started = true;
+            break;
+        }
+    }
+    assert!(saw_started, "A should have a STARTED row");
+
+    // B: reset executor to succeed. B must NOT be blocked by A's in-flight STARTED.
+    gw.executor.set_behavior(MockBehavior::Success {
+        columns: vec!["id".to_string()],
+        rows: vec![vec!["2".to_string()]],
+        affected_rows: None,
+    });
+    let req_b = GatewayRequest {
+        asset_id,
+        sql: "SELECT * FROM appdb.orders WHERE id = 2".to_string(),
+        options: ExecutionOptions::default(),
+    };
+    let result_b = gateway.execute(&gw.user, req_b).await;
+    assert!(result_b.is_ok(), "B must not be blocked by A's in-flight query: {result_b:?}");
+
+    handle_a.abort();
 }

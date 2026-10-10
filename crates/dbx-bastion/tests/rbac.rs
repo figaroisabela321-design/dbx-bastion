@@ -1074,7 +1074,15 @@ fn migration_0004_fresh_init() {
         .collect();
     assert_eq!(
         versions,
-        vec!["0001_init", "0002_auth", "0003_assets", "0004_rbac", "0005_audit", "0006_audit_recovery"]
+        vec![
+            "0001_init",
+            "0002_auth",
+            "0003_assets",
+            "0004_rbac",
+            "0005_audit",
+            "0006_audit_recovery",
+            "0007_audit_recovery_followup"
+        ]
     );
     for table in ["user_groups", "user_group_members", "group_roles"] {
         let count: i64 = conn

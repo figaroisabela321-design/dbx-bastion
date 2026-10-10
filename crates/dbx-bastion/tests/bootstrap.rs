@@ -117,7 +117,8 @@ async fn fresh_init_creates_schema_and_records_version() {
             "0003_assets".to_string(),
             "0004_rbac".to_string(),
             "0005_audit".to_string(),
-            "0006_audit_recovery".to_string()
+            "0006_audit_recovery".to_string(),
+            "0007_audit_recovery_followup".to_string()
         ]
     );
 
@@ -164,7 +165,7 @@ async fn migration_is_idempotent_and_preserves_data() {
     }
 
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(applied_versions(&conn).len(), 6, "migration versions must not be recorded twice");
+    assert_eq!(applied_versions(&conn).len(), 7, "migration versions must not be recorded twice");
     drop(conn);
     cleanup(&path);
 }

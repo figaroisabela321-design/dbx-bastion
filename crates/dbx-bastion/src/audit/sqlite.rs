@@ -94,6 +94,12 @@ impl SqliteAuditService {
         Self { store }
     }
 
+    /// Underlying store, for tests verifying the original audit row is
+    /// never modified by triage.
+    pub fn store(&self) -> &Arc<SqliteStore> {
+        &self.store
+    }
+
     /// Count rows by status. Used by operators and integration tests to
     /// verify that denials actually produced `blocked` rows (rather than
     /// merely claiming to).
@@ -195,22 +201,27 @@ impl AuditService for SqliteAuditService {
     }
 
     async fn has_untriaged_interruptions(&self) -> Result<bool> {
-        // An interruption blocks while it has NO recovery event, or its
-        // recovery conclusion is `still_unknown`. Only
-        // `confirmed_committed` / `confirmed_not_executed` lift the block.
+        // An interruption blocks while its LATEST recovery conclusion
+        // (by rowid) is not confirmed. (Issue 1+2: unified semantics,
+        // latest-wins for follow-up triage.)
+        // - No recovery event -> blocked.
+        // - Latest is still_unknown -> blocked.
+        // - Latest is confirmed_committed/confirmed_not_executed -> ok.
         // The original audit row is never modified by triage.
+        // Any DB failure propagates -> fail-closed.
         let count: i64 = self
             .store
             .blocking(|conn| {
                 let c: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM audit_events e
-                     WHERE e.status IN ('started', 'unknown_interrupted')
-                     AND NOT EXISTS (
-                         SELECT 1 FROM audit_recovery_events r
-                         WHERE r.audit_event_id = e.id
-                         AND r.conclusion IN ('confirmed_committed', 'confirmed_not_executed')
-                     )",
+                         WHERE e.status IN ('started', 'unknown_interrupted')
+                         AND COALESCE(
+                             (SELECT conclusion FROM audit_recovery_events r
+                              WHERE r.audit_event_id = e.id
+                              ORDER BY r.rowid DESC LIMIT 1),
+                             'still_unknown'
+                         ) NOT IN ('confirmed_committed', 'confirmed_not_executed')",
                         [],
                         |row| row.get(0),
                     )
@@ -222,11 +233,22 @@ impl AuditService for SqliteAuditService {
     }
 
     async fn list_unfinished(&self) -> Result<Vec<UnfinishedAudit>> {
+        // Unified semantics with has_untriaged_interruptions (Issue 1):
+        // only interruptions whose LATEST recovery conclusion is not
+        // confirmed are returned. Confirmed records are not "unfinished"
+        // for blocking purposes; the HTTP layer lists them separately
+        // if needed.
         self.store
             .blocking(|conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT id, status, started_at FROM audit_events
-                     WHERE status IN ('started', 'unknown_interrupted')
+                    "SELECT id, status, started_at FROM audit_events e
+                     WHERE e.status IN ('started', 'unknown_interrupted')
+                     AND COALESCE(
+                         (SELECT conclusion FROM audit_recovery_events r
+                          WHERE r.audit_event_id = e.id
+                          ORDER BY r.rowid DESC LIMIT 1),
+                         'still_unknown'
+                     ) NOT IN ('confirmed_committed', 'confirmed_not_executed')
                      ORDER BY started_at ASC",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -261,20 +283,24 @@ impl AuditService for SqliteAuditService {
 
 impl SqliteAuditService {
     /// Triage an unfinished audit record (`started` or
-    /// `unknown_interrupted`) after operator review (TASK-005E P0-2).
+    /// `unknown_interrupted`) after operator review (TASK-005E P0-2,
+    /// follow-up).
     ///
-    /// The original `audit_events` row is NEVER modified. The triage
-    /// appends one row to `audit_recovery_events` with the operator,
-    /// time, reason, evidence, original status, and conclusion.
+    /// The original `audit_events` row is NEVER modified. Each triage
+    /// appends one row to `audit_recovery_events`.
     ///
-    /// Rules (fail-closed):
-    /// - `reason` non-empty, `reason` <= 2000 chars, `evidence` <= 10000.
-    /// - `conclusion` is required: the caller must state what the
-    ///   evidence proves. `StillUnknown` keeps the execution block.
-    /// - Records in `in_flight` (actively executing) are rejected:
-    ///   only orphaned interruptions may be triaged.
-    /// - Already-triaged records are rejected (one triage per event).
-    /// - Triage failure never unblocks execution.
+    /// Follow-up model (migration 0007):
+    /// - `still_unknown` may later be followed by `confirmed_*` with
+    ///   evidence. The LATEST recovery event determines the effective
+    ///   conclusion.
+    /// - Once a `confirmed_committed` / `confirmed_not_executed`
+    ///   conclusion exists, no further triage is allowed (confirmed
+    ///   conclusions are irreversible).
+    /// - All history is preserved; nothing is overwritten.
+    ///
+    /// Concurrency (Issue 3): `inflight` is the gateway's live set,
+    /// locked for the entire check+INSERT. This closes the race where
+    /// a query starts between the HTTP-layer check and the DB insert.
     pub async fn triage_interruption(
         &self,
         id: Uuid,
@@ -282,7 +308,7 @@ impl SqliteAuditService {
         reason: &str,
         evidence: &str,
         conclusion: TriageConclusion,
-        in_flight: &std::collections::HashSet<Uuid>,
+        inflight: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<Uuid>>>,
     ) -> Result<()> {
         let reason = reason.trim();
         let evidence = evidence.trim();
@@ -303,12 +329,12 @@ impl SqliteAuditService {
         if conclusion.unblocks() && evidence.is_empty() {
             return Err(BastionError::InvalidData(format!("conclusion '{}' requires evidence", conclusion.as_str())));
         }
-        if in_flight.contains(&id) {
-            return Err(BastionError::InvalidData(format!(
-                "audit record {id} is actively executing; triage is forbidden"
-            )));
-        }
 
+        // Race-free handoff (Issue 3): the inflight lock is acquired
+        // INSIDE the blocking closure, held for check+INSERT. A query
+        // starting concurrently blocks on this lock until triage commits,
+        // and vice versa. The guard never crosses an `.await` (the closure
+        // is synchronous), so the future remains Send.
         let reason = reason.to_string();
         let evidence = evidence.to_string();
         let now = chrono::Utc::now().to_rfc3339();
@@ -317,21 +343,42 @@ impl SqliteAuditService {
 
         self.store
             .blocking(move |conn| {
+                // blocking_lock: this closure runs on spawn_blocking (not
+                // in async context), so blocking is safe. The lock is held
+                // for check+INSERT, closing the race with query start.
+                let _inflight_guard = inflight.blocking_lock();
+                if _inflight_guard.contains(&id) {
+                    return Err(BastionError::InvalidData(format!(
+                        "audit record {id} is actively executing; triage is forbidden"
+                    )));
+                }
                 // 1. The record must exist and be unfinished.
                 let original_status: String = conn
-                    .query_row(
-                        "SELECT status FROM audit_events WHERE id = ?1",
-                        [id.to_string()],
-                        |row| row.get(0),
-                    )
+                    .query_row("SELECT status FROM audit_events WHERE id = ?1", [id.to_string()], |row| row.get(0))
                     .map_err(|_| BastionError::NotFound(format!("audit record {id} not found")))?;
                 if !matches!(original_status.as_str(), "started" | "unknown_interrupted") {
                     return Err(BastionError::InvalidData(format!(
                         "audit record {id} is already terminal (status={original_status}); triage is only for interruptions"
                     )));
                 }
-                // 2. Append the recovery event. UNIQUE(audit_event_id)
-                //    rejects duplicate triage.
+                // 2. A confirmed conclusion is irreversible: reject any
+                //    further triage once one exists.
+                let confirmed: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM audit_recovery_events
+                         WHERE audit_event_id = ?1
+                         AND conclusion IN ('confirmed_committed', 'confirmed_not_executed')",
+                        [id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(BastionError::Storage)?;
+                if confirmed > 0 {
+                    return Err(BastionError::InvalidData(format!(
+                        "audit record {id} already has a confirmed conclusion; triage is irreversible"
+                    )));
+                }
+                // 3. Append the recovery event (append-only; history kept).
+                //    The inflight lock is held for the entire check+INSERT.
                 let inserted = conn.execute(
                     "INSERT INTO audit_recovery_events
                      (id, audit_event_id, triaged_by, triaged_at, original_status, conclusion, reason, evidence)
@@ -353,24 +400,25 @@ impl SqliteAuditService {
                 Ok(())
             })
             .await
-            .map_err(|e| match e {
-                // UNIQUE violation -> already triaged.
-                BastionError::Storage(rusqlite::Error::SqliteFailure(err, _)) if err.extended_code == 2067 => {
-                    BastionError::InvalidData(format!("audit record {id} has already been triaged"))
-                }
-                other => other,
-            })
     }
 
     /// Get the recovery event for an audit record, if triaged.
+    /// Latest recovery event for an audit record (by rowid), if any.
     pub async fn get_recovery_event(&self, audit_event_id: Uuid) -> Result<Option<RecoveryEvent>> {
+        let mut history = self.list_recovery_events(audit_event_id).await?;
+        Ok(history.pop())
+    }
+
+    /// Full triage history for an audit record, oldest first.
+    /// Append-only: every investigation step is traceable.
+    pub async fn list_recovery_events(&self, audit_event_id: Uuid) -> Result<Vec<RecoveryEvent>> {
         self.store
             .blocking(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT id, triaged_by, triaged_at, original_status, conclusion, reason, evidence
-                     FROM audit_recovery_events WHERE audit_event_id = ?1",
+                     FROM audit_recovery_events WHERE audit_event_id = ?1 ORDER BY rowid ASC",
                 )?;
-                let mut rows = stmt.query_map([audit_event_id.to_string()], |row| {
+                let rows = stmt.query_map([audit_event_id.to_string()], |row| {
                     let id: String = row.get(0)?;
                     let triaged_by: String = row.get(1)?;
                     let triaged_at: String = row.get(2)?;
@@ -392,10 +440,11 @@ impl SqliteAuditService {
                         evidence,
                     })
                 })?;
-                match rows.next() {
-                    Some(row) => Ok(Some(row?)),
-                    None => Ok(None),
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
                 }
+                Ok(out)
             })
             .await
     }
