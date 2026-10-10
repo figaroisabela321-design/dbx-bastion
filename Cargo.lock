@@ -2219,6 +2219,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbx-bastion"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "async-trait",
+ "chrono",
+ "hex",
+ "libc",
+ "rand_core 0.6.4",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlparser",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "dbx-cli"
 version = "0.4.109"
 dependencies = [
@@ -2745,12 +2766,16 @@ dependencies = [
  "aes-gcm 0.10.3",
  "argon2",
  "async-stream",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
+ "dbx-bastion",
  "dbx-core",
  "dbx-mcp",
+ "fs2",
  "futures",
+ "libc",
  "log",
  "mime_guess",
  "pbkdf2 0.12.2",
