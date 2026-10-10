@@ -270,6 +270,9 @@ pub async fn execute_query(
 pub struct TriageBody {
     pub reason: String,
     pub evidence: Option<String>,
+    /// Required: what the evidence proves. One of
+    /// `confirmed_committed`, `confirmed_not_executed`, `still_unknown`.
+    pub conclusion: String,
 }
 
 /// `GET /api/bastion/audit/interruptions` — list untriaged audit
@@ -287,9 +290,12 @@ pub async fn list_interruptions(State(state): State<Arc<BastionState>>, session:
 }
 
 /// `POST /api/bastion/audit/interruptions/:id/triage` — controlled
-/// recovery. Requires bastion-admin + non-empty reason. The record is
-/// transitioned to `failed` with triage metadata; never deleted, never
-/// silently reset.
+/// recovery (P0-2). Requires bastion-admin + non-empty reason +
+/// explicit conclusion. The original audit row is NEVER modified; the
+/// triage appends to `audit_recovery_events`. Only
+/// `confirmed_committed` / `confirmed_not_executed` lift the execution
+/// block; `still_unknown` keeps refusing. Actively-executing records
+/// cannot be triaged.
 pub async fn triage_interruption(
     State(state): State<Arc<BastionState>>,
     parts: Parts,
@@ -308,10 +314,43 @@ pub async fn triage_interruption(
         Ok(u) => u,
         Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
+    let conclusion = match dbx_bastion::audit::TriageConclusion::from_str(&body.conclusion) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "conclusion must be confirmed_committed, confirmed_not_executed, or still_unknown",
+            )
+                .into_response()
+        }
+    };
+    // Forbid triage of actively-executing records (P0-2 requirement 6).
+    // The gateway tracks in-flight audit IDs; the instance lock
+    // guarantees this process is the only writer.
+    if let Some(gw) = state.gateway.as_ref() {
+        if gw.is_inflight(&record_id) {
+            return (StatusCode::CONFLICT, "audit record is actively executing; triage is forbidden").into_response();
+        }
+    }
+    // Pass an empty set: the gateway check above already rejected
+    // in-flight IDs. The service also guards against in-flight IDs
+    // passed by other callers (defense in depth).
+    let inflight_set = std::collections::HashSet::new();
     let audit = dbx_bastion::audit::SqliteAuditService::new(state.service.store().clone());
-    match audit.triage_interruption(record_id, admin_id, &body.reason, body.evidence.as_deref().unwrap_or("")).await {
+    match audit
+        .triage_interruption(
+            record_id,
+            admin_id,
+            &body.reason,
+            body.evidence.as_deref().unwrap_or(""),
+            conclusion,
+            &inflight_set,
+        )
+        .await
+    {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(dbx_bastion::BastionError::NotFound(_)) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(dbx_bastion::BastionError::InvalidData(msg)) => (StatusCode::BAD_REQUEST, msg).into_response(),
         Err(_) => (StatusCode::BAD_REQUEST, "triage failed").into_response(),
     }
 }

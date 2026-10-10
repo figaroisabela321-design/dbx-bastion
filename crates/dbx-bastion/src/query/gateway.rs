@@ -143,6 +143,13 @@ impl QueryGateway {
         }
     }
 
+    /// True while this gateway instance has an actively executing query
+    /// with this audit ID. Triage of in-flight records is forbidden
+    /// (P0-2): only orphaned interruptions may be triaged.
+    pub fn is_inflight(&self, audit_id: &uuid::Uuid) -> bool {
+        self.inflight.lock().unwrap().contains(audit_id)
+    }
+
     fn dialect_for(db_type: &str) -> SqlDialect {
         match db_type.to_lowercase().as_str() {
             "mysql" | "mariadb" => SqlDialect::MySql,

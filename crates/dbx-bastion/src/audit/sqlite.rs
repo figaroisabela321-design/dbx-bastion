@@ -16,7 +16,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use uuid::Uuid;
 
-use super::{AuditEvent, AuditOutcome, AuditService, AuditStatus, UnfinishedAudit};
+use super::{
+    AuditEvent, AuditOutcome, AuditService, AuditStatus, RecoveryEvent, TriageConclusion, UnfinishedAudit,
+    MAX_TRIAGE_EVIDENCE_LEN, MAX_TRIAGE_REASON_LEN,
+};
 use crate::error::{BastionError, Result};
 use crate::storage::SqliteStore;
 
@@ -192,11 +195,30 @@ impl AuditService for SqliteAuditService {
     }
 
     async fn has_untriaged_interruptions(&self) -> Result<bool> {
-        // Conservative direct-service check: any unfinished row counts.
-        // The gateway refines this with its in-flight set (see
-        // `list_unfinished`); concurrent queries in one process must not
-        // block each other.
-        Ok(!self.list_unfinished().await?.is_empty())
+        // An interruption blocks while it has NO recovery event, or its
+        // recovery conclusion is `still_unknown`. Only
+        // `confirmed_committed` / `confirmed_not_executed` lift the block.
+        // The original audit row is never modified by triage.
+        let count: i64 = self
+            .store
+            .blocking(|conn| {
+                let c: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM audit_events e
+                     WHERE e.status IN ('started', 'unknown_interrupted')
+                     AND NOT EXISTS (
+                         SELECT 1 FROM audit_recovery_events r
+                         WHERE r.audit_event_id = e.id
+                         AND r.conclusion IN ('confirmed_committed', 'confirmed_not_executed')
+                     )",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(BastionError::Storage)?;
+                Ok(c)
+            })
+            .await?;
+        Ok(count > 0)
     }
 
     async fn list_unfinished(&self) -> Result<Vec<UnfinishedAudit>> {
@@ -239,41 +261,143 @@ impl AuditService for SqliteAuditService {
 
 impl SqliteAuditService {
     /// Triage an unfinished audit record (`started` or
-    /// `unknown_interrupted`) after operator review.
+    /// `unknown_interrupted`) after operator review (TASK-005E P0-2).
     ///
-    /// This is the controlled recovery path: the caller must have
-    /// verified admin identity (via `AssetAdminGuard`), and must
-    /// supply a reason and evidence. The record transitions to
-    /// `failed` with triage metadata appended — it is never deleted
-    /// and the status is never silently reset.
-    pub async fn triage_interruption(&self, id: Uuid, triaged_by: Uuid, reason: &str, evidence: &str) -> Result<()> {
-        if reason.trim().is_empty() {
+    /// The original `audit_events` row is NEVER modified. The triage
+    /// appends one row to `audit_recovery_events` with the operator,
+    /// time, reason, evidence, original status, and conclusion.
+    ///
+    /// Rules (fail-closed):
+    /// - `reason` non-empty, `reason` <= 2000 chars, `evidence` <= 10000.
+    /// - `conclusion` is required: the caller must state what the
+    ///   evidence proves. `StillUnknown` keeps the execution block.
+    /// - Records in `in_flight` (actively executing) are rejected:
+    ///   only orphaned interruptions may be triaged.
+    /// - Already-triaged records are rejected (one triage per event).
+    /// - Triage failure never unblocks execution.
+    pub async fn triage_interruption(
+        &self,
+        id: Uuid,
+        triaged_by: Uuid,
+        reason: &str,
+        evidence: &str,
+        conclusion: TriageConclusion,
+        in_flight: &std::collections::HashSet<Uuid>,
+    ) -> Result<()> {
+        let reason = reason.trim();
+        let evidence = evidence.trim();
+        if reason.is_empty() {
             return Err(BastionError::InvalidData("triage reason is required".to_string()));
         }
-        let triage_note = format!(
-            "[triaged by {triaged_by} at {}: {} | evidence: {}]",
-            chrono::Utc::now().to_rfc3339(),
-            reason.trim(),
-            evidence.trim(),
-        );
-        let updated = self
-            .store
-            .blocking(move |conn| {
-                // Only unfinished rows may be triaged.
-                let updated = conn.execute(
-                    "UPDATE audit_events SET status = 'failed', success = 0,
-                     error_message = COALESCE(error_message, '') || ?1,
-                     finished_at = ?2
-                     WHERE id = ?3 AND status IN ('started', 'unknown_interrupted')",
-                    rusqlite::params![triage_note, chrono::Utc::now().to_rfc3339(), id.to_string(),],
-                )?;
-                Ok(updated)
-            })
-            .await?;
-        if updated != 1 {
-            return Err(BastionError::NotFound(format!("unfinished audit record {id} not found")));
+        if reason.len() > MAX_TRIAGE_REASON_LEN {
+            return Err(BastionError::InvalidData(format!("triage reason exceeds {} chars", MAX_TRIAGE_REASON_LEN)));
         }
-        Ok(())
+        if evidence.len() > MAX_TRIAGE_EVIDENCE_LEN {
+            return Err(BastionError::InvalidData(format!(
+                "triage evidence exceeds {} chars",
+                MAX_TRIAGE_EVIDENCE_LEN
+            )));
+        }
+        // confirmed_* conclusions require evidence; still_unknown may
+        // document the investigation without proof.
+        if conclusion.unblocks() && evidence.is_empty() {
+            return Err(BastionError::InvalidData(format!("conclusion '{}' requires evidence", conclusion.as_str())));
+        }
+        if in_flight.contains(&id) {
+            return Err(BastionError::InvalidData(format!(
+                "audit record {id} is actively executing; triage is forbidden"
+            )));
+        }
+
+        let reason = reason.to_string();
+        let evidence = evidence.to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let conclusion_str = conclusion.as_str().to_string();
+        let recovery_id = Uuid::new_v4().to_string();
+
+        self.store
+            .blocking(move |conn| {
+                // 1. The record must exist and be unfinished.
+                let original_status: String = conn
+                    .query_row(
+                        "SELECT status FROM audit_events WHERE id = ?1",
+                        [id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| BastionError::NotFound(format!("audit record {id} not found")))?;
+                if !matches!(original_status.as_str(), "started" | "unknown_interrupted") {
+                    return Err(BastionError::InvalidData(format!(
+                        "audit record {id} is already terminal (status={original_status}); triage is only for interruptions"
+                    )));
+                }
+                // 2. Append the recovery event. UNIQUE(audit_event_id)
+                //    rejects duplicate triage.
+                let inserted = conn.execute(
+                    "INSERT INTO audit_recovery_events
+                     (id, audit_event_id, triaged_by, triaged_at, original_status, conclusion, reason, evidence)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        recovery_id,
+                        id.to_string(),
+                        triaged_by.to_string(),
+                        now,
+                        original_status,
+                        conclusion_str,
+                        reason,
+                        evidence,
+                    ],
+                )?;
+                if inserted != 1 {
+                    return Err(BastionError::Storage(rusqlite::Error::QueryReturnedNoRows));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| match e {
+                // UNIQUE violation -> already triaged.
+                BastionError::Storage(rusqlite::Error::SqliteFailure(err, _)) if err.extended_code == 2067 => {
+                    BastionError::InvalidData(format!("audit record {id} has already been triaged"))
+                }
+                other => other,
+            })
+    }
+
+    /// Get the recovery event for an audit record, if triaged.
+    pub async fn get_recovery_event(&self, audit_event_id: Uuid) -> Result<Option<RecoveryEvent>> {
+        self.store
+            .blocking(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, triaged_by, triaged_at, original_status, conclusion, reason, evidence
+                     FROM audit_recovery_events WHERE audit_event_id = ?1",
+                )?;
+                let mut rows = stmt.query_map([audit_event_id.to_string()], |row| {
+                    let id: String = row.get(0)?;
+                    let triaged_by: String = row.get(1)?;
+                    let triaged_at: String = row.get(2)?;
+                    let original_status: String = row.get(3)?;
+                    let conclusion: String = row.get(4)?;
+                    let reason: String = row.get(5)?;
+                    let evidence: String = row.get(6)?;
+                    Ok(RecoveryEvent {
+                        id: id.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        audit_event_id,
+                        triaged_by: triaged_by.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        triaged_at: triaged_at.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        original_status: match original_status.as_str() {
+                            "started" => AuditStatus::Started,
+                            _ => AuditStatus::UnknownInterrupted,
+                        },
+                        conclusion: TriageConclusion::from_str(&conclusion).ok_or(rusqlite::Error::InvalidQuery)?,
+                        reason,
+                        evidence,
+                    })
+                })?;
+                match rows.next() {
+                    Some(row) => Ok(Some(row?)),
+                    None => Ok(None),
+                }
+            })
+            .await
     }
 }
 

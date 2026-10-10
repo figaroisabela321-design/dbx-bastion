@@ -132,6 +132,63 @@ pub struct UnfinishedAudit {
     pub started_at: DateTime<Utc>,
 }
 
+/// Operator conclusion for an interrupted audit record (TASK-005E P0-2).
+///
+/// - `ConfirmedCommitted`: evidence proves the SQL actually committed.
+/// - `ConfirmedNotExecuted`: evidence proves it never executed.
+/// - `StillUnknown`: outcome remains unknown; execution stays blocked.
+///
+/// The original audit row is never modified; the conclusion lives in
+/// the append-only `audit_recovery_events` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageConclusion {
+    ConfirmedCommitted,
+    ConfirmedNotExecuted,
+    StillUnknown,
+}
+
+impl TriageConclusion {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TriageConclusion::ConfirmedCommitted => "confirmed_committed",
+            TriageConclusion::ConfirmedNotExecuted => "confirmed_not_executed",
+            TriageConclusion::StillUnknown => "still_unknown",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "confirmed_committed" => Some(TriageConclusion::ConfirmedCommitted),
+            "confirmed_not_executed" => Some(TriageConclusion::ConfirmedNotExecuted),
+            "still_unknown" => Some(TriageConclusion::StillUnknown),
+            _ => None,
+        }
+    }
+
+    /// Only these conclusions lift the execution block.
+    pub fn unblocks(&self) -> bool {
+        matches!(self, TriageConclusion::ConfirmedCommitted | TriageConclusion::ConfirmedNotExecuted)
+    }
+}
+
+/// One row of the append-only `audit_recovery_events` table.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryEvent {
+    pub id: Uuid,
+    pub audit_event_id: Uuid,
+    pub triaged_by: Uuid,
+    pub triaged_at: DateTime<Utc>,
+    pub original_status: AuditStatus,
+    pub conclusion: TriageConclusion,
+    pub reason: String,
+    pub evidence: String,
+}
+
+/// Maximum lengths for triage reason/evidence (P0-2 requirement 8).
+pub const MAX_TRIAGE_REASON_LEN: usize = 2000;
+pub const MAX_TRIAGE_EVIDENCE_LEN: usize = 10000;
+
 #[async_trait::async_trait]
 pub trait AuditService: Send + Sync {
     /// Append a `Started` record. `Err` means the audit store is

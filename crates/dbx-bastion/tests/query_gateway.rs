@@ -720,3 +720,275 @@ async fn blocked_denials_produce_audit_rows() {
     assert_eq!(gw.audit.inner.count_by_status(AuditStatus::Blocked).await.unwrap(), 2);
     assert_eq!(gw.executor.calls(), 0);
 }
+
+// ---- P0-2: audit triage redesign --------------------------------------
+
+use dbx_bastion::audit::{AuditEvent, TriageConclusion};
+use dbx_bastion::query::StatementAction;
+use std::collections::HashSet;
+
+fn triage_audit() -> SqliteAuditService {
+    let db_path = temp_db_path("triage");
+    let _ = std::fs::remove_file(&db_path);
+    let service = BastionService::open(&db_path).unwrap();
+    SqliteAuditService::new(service.store().clone())
+}
+
+fn started_event() -> AuditEvent {
+    AuditEvent {
+        id: Uuid::new_v4(),
+        user_id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        asset_id: Uuid::new_v4(),
+        database: None,
+        schema: None,
+        sql_text: "SELECT 1".to_string(),
+        sql_hash: "00".to_string(),
+        action: StatementAction::Select,
+        risk_level: dbx_bastion::policy::RiskLevel::Low,
+        policy_decision: None,
+        source_ip: None,
+        client_request_id: None,
+        status: AuditStatus::Started,
+        success: None,
+        row_count: None,
+        duration_ms: None,
+        error_message: None,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+    }
+}
+
+#[tokio::test]
+async fn triage_confirmed_committed_preserves_original() {
+    let audit = triage_audit();
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    // Triage as confirmed_committed with evidence.
+    audit
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "DBA confirmed the transaction committed",
+            "binlog shows COMMIT at 2026-10-10T10:00:00Z",
+            TriageConclusion::ConfirmedCommitted,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+    // Original row is NOT modified: status stays `started`, not `failed`.
+    let unfinished = audit.list_unfinished().await.unwrap();
+    assert!(unfinished.iter().any(|u| u.id == id && u.status == AuditStatus::Started));
+
+    // Recovery event exists with the conclusion.
+    let recovery = audit.get_recovery_event(id).await.unwrap().expect("recovery event");
+    assert_eq!(recovery.conclusion, TriageConclusion::ConfirmedCommitted);
+    assert_eq!(recovery.original_status, AuditStatus::Started);
+
+    // Execution is unblocked (has_untriaged_interruptions = false).
+    assert!(!audit.has_untriaged_interruptions().await.unwrap());
+}
+
+#[tokio::test]
+async fn triage_still_unknown_keeps_block() {
+    let audit = triage_audit();
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    audit
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "Cannot determine outcome from logs",
+            "",
+            TriageConclusion::StillUnknown,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+    // Still blocked: still_unknown does not lift the block.
+    assert!(audit.has_untriaged_interruptions().await.unwrap());
+
+    // Original preserved.
+    let unfinished = audit.list_unfinished().await.unwrap();
+    assert!(unfinished.iter().any(|u| u.id == id));
+}
+
+#[tokio::test]
+async fn triage_inflight_started_rejected() {
+    let audit = triage_audit();
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    let mut inflight = HashSet::new();
+    inflight.insert(id);
+
+    let err = audit
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "reason",
+            "evidence",
+            TriageConclusion::ConfirmedNotExecuted,
+            &inflight,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("actively executing"), "unexpected: {err}");
+
+    // Still blocked, no recovery event.
+    assert!(audit.has_untriaged_interruptions().await.unwrap());
+    assert!(audit.get_recovery_event(id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn triage_duplicate_rejected() {
+    let audit = triage_audit();
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    audit
+        .triage_interruption(id, Uuid::new_v4(), "first", "e1", TriageConclusion::ConfirmedNotExecuted, &HashSet::new())
+        .await
+        .unwrap();
+
+    let err = audit
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "second",
+            "e2",
+            TriageConclusion::ConfirmedNotExecuted,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already been triaged"), "unexpected: {err}");
+}
+
+#[tokio::test]
+async fn triage_requires_reason_and_evidence_for_confirmed() {
+    let audit = triage_audit();
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    // Empty reason rejected.
+    let err = audit
+        .triage_interruption(id, Uuid::new_v4(), "  ", "e", TriageConclusion::ConfirmedNotExecuted, &HashSet::new())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("reason is required"));
+
+    // confirmed_* without evidence rejected.
+    let err = audit
+        .triage_interruption(id, Uuid::new_v4(), "reason", "", TriageConclusion::ConfirmedCommitted, &HashSet::new())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("requires evidence"));
+}
+
+#[tokio::test]
+async fn triage_rejects_overlong_inputs() {
+    let audit = triage_audit();
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    let long_reason = "x".repeat(2001);
+    let err = audit
+        .triage_interruption(id, Uuid::new_v4(), &long_reason, "e", TriageConclusion::StillUnknown, &HashSet::new())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("exceeds"));
+
+    let long_evidence = "y".repeat(10001);
+    let err = audit
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "reason",
+            &long_evidence,
+            TriageConclusion::StillUnknown,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("exceeds"));
+}
+
+#[tokio::test]
+async fn triage_terminal_record_rejected() {
+    let audit = triage_audit();
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+    // Finish it (terminal).
+    audit
+        .record_finished(
+            id,
+            dbx_bastion::audit::AuditOutcome {
+                status: AuditStatus::Failed,
+                success: Some(false),
+                row_count: None,
+                duration_ms: Some(10),
+                error_message: Some("err".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let err = audit
+        .triage_interruption(id, Uuid::new_v4(), "reason", "e", TriageConclusion::StillUnknown, &HashSet::new())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already terminal"));
+}
+
+// ---- P0-1: CTE must not bypass table-level DENY via QueryGateway ----
+
+#[tokio::test]
+async fn gateway_cte_does_not_bypass_table_deny() {
+    let gw = Gw::new("cte-deny").await;
+    // Add a DENY on appdb.secret for the user's role.
+    let grants = GrantService::new(gw.service.store().clone(), Arc::new(SystemClock));
+    grants
+        .create_grant(
+            &gw.admin,
+            NewGrant {
+                role_id: gw.role_id,
+                effect: Effect::Deny,
+                action: Action::Select,
+                scope: AssetScope::Asset(gw.asset_id),
+                database: Some("appdb".to_string()),
+                schema: None,
+                table: Some("secret".to_string()),
+                expires_at: None,
+            },
+        )
+        .await
+        .expect("deny grant");
+
+    // Attack: CTE named `secret`, then qualified reference to the real
+    // `appdb.secret`. The qualified name must hit the DENY, not be
+    // skipped as a CTE reference.
+    let err = gw
+        .gateway
+        .execute(&gw.user, gw.req("WITH secret AS (SELECT 1 AS x) SELECT * FROM appdb.secret"))
+        .await
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("Denied") || msg.contains("denied") || msg.contains("Forbidden") || msg.contains("RBAC"),
+        "qualified table behind CTE name must be denied, got: {msg}"
+    );
+    // The executor must not have been called.
+    assert_eq!(gw.executor.calls(), 0, "denied query must not reach the executor");
+}

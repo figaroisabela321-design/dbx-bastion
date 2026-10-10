@@ -903,7 +903,10 @@ fn migration_idempotent_and_failed_migration_rolls_back() {
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
-    assert_eq!(versions, vec!["0001_init", "0002_auth", "0003_assets", "0004_rbac", "0005_audit"]);
+    assert_eq!(
+        versions,
+        vec!["0001_init", "0002_auth", "0003_assets", "0004_rbac", "0005_audit", "0006_audit_recovery"]
+    );
 
     // A failing migration records nothing and leaves no partial schema.
     let mut conn = conn;
