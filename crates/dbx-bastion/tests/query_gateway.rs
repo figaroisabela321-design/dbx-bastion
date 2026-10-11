@@ -1912,3 +1912,143 @@ async fn p1_06_poisoned_mutex_blocks_execution() {
     );
     assert_eq!(gw.executor.calls(), 0, "P1-06: executor must not be called with poisoned mutex");
 }
+
+// ===== P2-001: audit_id runtime consistency check =====
+
+/// Fake AuditService that returns a WRONG audit_id from record_started.
+/// Simulates a buggy/malicious implementation.
+struct MismatchedAudit {
+    inner: SqliteAuditService,
+}
+
+#[async_trait::async_trait]
+impl AuditService for MismatchedAudit {
+    async fn record_started(&self, event: dbx_bastion::audit::AuditEvent) -> dbx_bastion::Result<Uuid> {
+        // Persist the real event (so the DB is consistent), but return a
+        // DIFFERENT ID to simulate the mismatch.
+        let _ = self.inner.record_started(event).await?;
+        Ok(Uuid::new_v4()) // WRONG: not the persisted ID
+    }
+    async fn record_finished(&self, id: Uuid, outcome: dbx_bastion::audit::AuditOutcome) -> dbx_bastion::Result<()> {
+        self.inner.record_finished(id, outcome).await
+    }
+    async fn list_unfinished(&self) -> dbx_bastion::Result<Vec<dbx_bastion::audit::UnfinishedAudit>> {
+        self.inner.list_unfinished().await
+    }
+    async fn has_untriaged_interruptions(&self) -> dbx_bastion::Result<bool> {
+        self.inner.has_untriaged_interruptions().await
+    }
+}
+
+#[tokio::test]
+async fn p2_001_mismatched_audit_id_blocks_execution() {
+    // P2-001: If record_started returns a different ID than the pre-generated
+    // one, the gateway must:
+    // 1. NOT call the executor (calls == 0)
+    // 2. Enter fail-closed state (subsequent queries rejected)
+    // 3. Work in both debug and release (runtime check, not debug_assert)
+    let gw = Gw::new("p2-001").await;
+    gw.grant(Action::Select, "t").await;
+    let gateway = QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(MismatchedAudit { inner: SqliteAuditService::new(gw.service.store().clone()) })
+            as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    );
+    gw.executor.set_behavior(MockBehavior::Success {
+        columns: vec!["c".to_string()],
+        rows: vec![],
+        affected_rows: None,
+    });
+
+    let err = gateway
+        .execute(
+            &gw.user,
+            GatewayRequest {
+                asset_id: gw.asset_id,
+                sql: "SELECT * FROM appdb.t".to_string(),
+                options: ExecutionOptions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("AuditFailClosed"), "P2-001: mismatch must fail-closed, got: {msg}");
+    // Executor must NEVER be called.
+    assert_eq!(gw.executor.calls(), 0, "P2-001: executor must see zero calls on ID mismatch");
+    // Gateway must be latched: subsequent queries rejected.
+    let err2 = gateway
+        .execute(
+            &gw.user,
+            GatewayRequest {
+                asset_id: gw.asset_id,
+                sql: "SELECT * FROM appdb.t".to_string(),
+                options: ExecutionOptions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{err2:?}").contains("AuditFailClosed"), "P2-001: gateway must stay blocked, got: {err2:?}");
+    // Inflight must be cleaned up (no leak of the pre-generated ID).
+    assert!(gateway.inflight_set().lock().unwrap().is_empty(), "P2-001: inflight must be cleaned up after mismatch");
+}
+
+// ===== P2-003: ActiveExecutionConflict unified error =====
+
+#[tokio::test]
+async fn p2_003_service_returns_active_execution_conflict() {
+    // P2-003: Triage of an actively-executing record must return the
+    // dedicated ActiveExecutionConflict variant (not InvalidData),
+    // so the HTTP layer can map it to 409 consistently.
+    let gw = Gw::new("p2-003").await;
+    let audit = SqliteAuditService::new(gw.service.store().clone());
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    let inflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    inflight.lock().unwrap().insert(id);
+
+    let err = audit
+        .triage_interruption(id, Uuid::new_v4(), "p2-003", "evidence", TriageConclusion::ConfirmedNotExecuted, inflight)
+        .await
+        .unwrap_err();
+    // Must be the dedicated variant, not InvalidData.
+    assert!(
+        matches!(err, BastionError::ActiveExecutionConflict(_)),
+        "P2-003: expected ActiveExecutionConflict variant, got: {err:?}"
+    );
+    // The display message is preserved for logs.
+    assert!(err.to_string().contains("actively executing"));
+}
+
+#[tokio::test]
+async fn p2_003_invalid_data_still_400_semantics() {
+    // P2-003: InvalidData (e.g. missing reason) must NOT become
+    // ActiveExecutionConflict. The variant is only for active execution.
+    let gw = Gw::new("p2-003b").await;
+    let audit = SqliteAuditService::new(gw.service.store().clone());
+    let event = started_event();
+    let id = event.id;
+    audit.record_started(event).await.unwrap();
+
+    let inflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    // Empty reason -> InvalidData (not ActiveExecutionConflict).
+    let err = audit
+        .triage_interruption(
+            id,
+            Uuid::new_v4(),
+            "", // empty reason
+            "evidence",
+            TriageConclusion::ConfirmedNotExecuted,
+            inflight,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BastionError::InvalidData(_)), "P2-003: empty reason must be InvalidData, got: {err:?}");
+    assert!(
+        !matches!(err, BastionError::ActiveExecutionConflict(_)),
+        "P2-003: InvalidData must not be confused with conflict"
+    );
+}

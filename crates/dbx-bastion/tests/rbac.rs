@@ -1081,7 +1081,8 @@ fn migration_0004_fresh_init() {
             "0004_rbac",
             "0005_audit",
             "0006_audit_recovery",
-            "0007_audit_recovery_followup"
+            "0007_audit_recovery_followup",
+            "0008_audit_append_only"
         ]
     );
     for table in ["user_groups", "user_group_members", "group_roles"] {

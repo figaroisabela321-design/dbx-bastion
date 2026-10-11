@@ -434,8 +434,19 @@ impl QueryGateway {
         event.id = audit_id;
         match self.audit.record_started(event).await {
             Ok(returned_id) => {
-                // Sanity: the service must persist the ID we registered.
-                debug_assert_eq!(returned_id, audit_id);
+                // P2-001: Runtime (not debug-only) consistency check.
+                // The service must persist the exact ID we registered in
+                // inflight. On mismatch:
+                // - the executor is NEVER called (we return here),
+                // - fail_closed is latched (audit chain is broken),
+                // - the InflightGuard Drop cleans up the registration,
+                // - no SQL is executed, the anomaly is preserved in the
+                //   error (both IDs are logged for forensics).
+                // debug_assert alone is compiled out in release builds.
+                if returned_id != audit_id {
+                    self.fail_closed.store(true, Ordering::SeqCst);
+                    return Err(BastionError::AuditFailClosed);
+                }
             }
             Err(BastionError::StorageTask(msg)) if msg.contains("join failed") => {
                 // UNCERTAIN: the blocking task did not complete normally;

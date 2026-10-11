@@ -39,6 +39,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0005_audit", include_str!("../migrations/0005_audit.sql")),
     ("0006_audit_recovery", include_str!("../migrations/0006_audit_recovery.sql")),
     ("0007_audit_recovery_followup", include_str!("../migrations/0007_audit_recovery_followup.sql")),
+    ("0008_audit_append_only", include_str!("../migrations/0008_audit_append_only.sql")),
 ];
 
 /// SQLITE_CONSTRAINT_UNIQUE extended error code.

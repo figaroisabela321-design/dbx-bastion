@@ -912,7 +912,8 @@ fn migration_idempotent_and_failed_migration_rolls_back() {
             "0004_rbac",
             "0005_audit",
             "0006_audit_recovery",
-            "0007_audit_recovery_followup"
+            "0007_audit_recovery_followup",
+            "0008_audit_append_only"
         ]
     );
 

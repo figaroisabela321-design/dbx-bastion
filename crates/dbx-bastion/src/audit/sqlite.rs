@@ -341,15 +341,15 @@ impl SqliteAuditService {
         // (Poison -> fail-closed: assume in-flight, reject triage.)
         let is_inflight = inflight.lock().map(|g| g.contains(&id)).unwrap_or(true);
         if is_inflight {
-            return Err(BastionError::InvalidData(format!(
-                "audit record {id} is actively executing; triage is forbidden"
-            )));
+            // P2-003: Return the dedicated variant (not InvalidData) so
+            // the HTTP layer maps it to 409 Conflict consistently.
+            return Err(BastionError::ActiveExecutionConflict(id.to_string()));
         }
-        // Race-free handoff (Issue 3): the inflight lock is acquired
-        // INSIDE the blocking closure, held for check+INSERT. A query
-        // starting concurrently blocks on this lock until triage commits,
-        // and vice versa. The guard never crosses an `.await` (the closure
-        // is synchronous), so the future remains Send.
+        // P0-A (updated): The inflight check above is a point-in-time
+        // check, NOT held inside the blocking closure. Audit IDs are fresh
+        // UUIDs, never reused: the gateway cannot start a query with the ID
+        // being triaged, so no check+INSERT race exists. Locks are never
+        // nested (no SQLite -> inflight ordering).
         let reason = reason.to_string();
         let evidence = evidence.to_string();
         let now = chrono::Utc::now().to_rfc3339();

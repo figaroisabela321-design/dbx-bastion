@@ -350,8 +350,51 @@ pub async fn triage_interruption(
         .await
     {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(dbx_bastion::BastionError::NotFound(_)) => (StatusCode::NOT_FOUND, "not found").into_response(),
-        Err(dbx_bastion::BastionError::InvalidData(msg)) => (StatusCode::BAD_REQUEST, msg).into_response(),
-        Err(_) => (StatusCode::BAD_REQUEST, "triage failed").into_response(),
+        Err(e) => triage_error_response(e),
+    }
+}
+
+/// Map triage service errors to HTTP responses (P2-003).
+/// - ActiveExecutionConflict -> 409 Conflict
+/// - InvalidData -> 400 Bad Request
+/// - NotFound -> 404 Not Found
+/// - Others -> 400 Bad Request (fail-closed: never 200 on error)
+fn triage_error_response(err: dbx_bastion::BastionError) -> axum::response::Response {
+    use dbx_bastion::BastionError;
+    match err {
+        BastionError::NotFound(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        // P2-003: Active execution conflict maps to 409 (not 400).
+        BastionError::ActiveExecutionConflict(_) => {
+            (StatusCode::CONFLICT, "audit record is actively executing; triage is forbidden").into_response()
+        }
+        BastionError::InvalidData(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+        _ => (StatusCode::BAD_REQUEST, "triage failed").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p2_003_active_conflict_maps_to_409() {
+        // P2-003: ActiveExecutionConflict must map to 409 Conflict
+        // (not 400). This is the HTTP-layer contract.
+        let resp = triage_error_response(dbx_bastion::BastionError::ActiveExecutionConflict("test-id".to_string()));
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn p2_003_invalid_data_maps_to_400() {
+        // P2-003: InvalidData (e.g. bad conclusion, missing reason)
+        // must remain 400 Bad Request.
+        let resp = triage_error_response(dbx_bastion::BastionError::InvalidData("bad".to_string()));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn p2_003_not_found_maps_to_404() {
+        let resp = triage_error_response(dbx_bastion::BastionError::NotFound("x".to_string()));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -91,6 +91,13 @@ pub enum BastionError {
     #[error("audit fail-closed: untriaged interrupted executions exist")]
     AuditFailClosed,
 
+    /// A triage was attempted on an audit record that is actively executing.
+    /// The service layer returns this (not InvalidData) so the HTTP layer
+    /// can map it consistently to 409 Conflict. Fail-closed: the triage
+    /// is rejected, the execution continues.
+    #[error("audit record {0} is actively executing; triage is forbidden")]
+    ActiveExecutionConflict(String),
+
     #[error("execution timed out")]
     ExecutionTimeout,
 

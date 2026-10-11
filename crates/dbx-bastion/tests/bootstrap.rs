@@ -118,7 +118,8 @@ async fn fresh_init_creates_schema_and_records_version() {
             "0004_rbac".to_string(),
             "0005_audit".to_string(),
             "0006_audit_recovery".to_string(),
-            "0007_audit_recovery_followup".to_string()
+            "0007_audit_recovery_followup".to_string(),
+            "0008_audit_append_only".to_string()
         ]
     );
 
@@ -165,7 +166,7 @@ async fn migration_is_idempotent_and_preserves_data() {
     }
 
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(applied_versions(&conn).len(), 7, "migration versions must not be recorded twice");
+    assert_eq!(applied_versions(&conn).len(), 8, "migration versions must not be recorded twice");
     drop(conn);
     cleanup(&path);
 }
@@ -243,5 +244,226 @@ async fn bastion_db_is_isolated_from_sibling_database_files() {
     assert!(table_names(&bastion).iter().any(|t| t == "assets"));
     drop(bastion);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ===== P2-002: audit_recovery_events append-only triggers =====
+
+#[test]
+fn p2_002_recovery_update_rejected() {
+    // P2-002: Direct UPDATE on audit_recovery_events must be rejected
+    // by the database trigger (not just application code).
+    let dir = std::env::temp_dir().join(format!(
+        "dbx-bastion-test-{}-{}-p2",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    dbx_bastion::secure_dir::ensure_secure_dir(&dir).unwrap();
+    let db_path = dir.join("bastion.db");
+    let service = BastionService::open(&db_path).expect("open");
+    let conn = Connection::open(&db_path).unwrap();
+
+    // Seed a recovery event via the service (legitimate INSERT).
+    // (We use raw SQL here to avoid the full triage setup.)
+    conn.execute(
+        "INSERT INTO audit_events (id, user_id, session_id, asset_id, sql_text, sql_hash, action, sql_kind, risk_level, status, started_at)
+         VALUES ('a1', 'u1', 's1', 'asset1', 'SELECT 1', 'hash', 'Select', 'Select', 'Low', 'started', '2026-01-01T00:00:00Z')",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO audit_recovery_events (id, audit_event_id, triaged_by, triaged_at, original_status, conclusion, reason, evidence)
+         VALUES ('r1', 'a1', 'admin1', '2026-01-01T01:00:00Z', 'started', 'still_unknown', 'investigating', '')",
+        [],
+    ).unwrap();
+
+    // UPDATE must fail.
+    let err = conn.execute("UPDATE audit_recovery_events SET reason = 'tampered' WHERE id = 'r1'", []).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("append-only"), "P2-002: UPDATE must be rejected by trigger, got: {msg}");
+    // Row must be unchanged.
+    let reason: String =
+        conn.query_row("SELECT reason FROM audit_recovery_events WHERE id = 'r1'", [], |row| row.get(0)).unwrap();
+    assert_eq!(reason, "investigating");
+
+    drop(service);
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn p2_002_recovery_delete_rejected() {
+    // P2-002: Direct DELETE must be rejected.
+    let dir = std::env::temp_dir().join(format!(
+        "dbx-bastion-test-{}-{}-p2",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    dbx_bastion::secure_dir::ensure_secure_dir(&dir).unwrap();
+    let db_path = dir.join("bastion.db");
+    let service = BastionService::open(&db_path).expect("open");
+    let conn = Connection::open(&db_path).unwrap();
+
+    conn.execute(
+        "INSERT INTO audit_events (id, user_id, session_id, asset_id, sql_text, sql_hash, action, sql_kind, risk_level, status, started_at)
+         VALUES ('a2', 'u1', 's1', 'asset1', 'SELECT 1', 'hash', 'Select', 'Select', 'Low', 'started', '2026-01-01T00:00:00Z')",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO audit_recovery_events (id, audit_event_id, triaged_by, triaged_at, original_status, conclusion, reason, evidence)
+         VALUES ('r2', 'a2', 'admin1', '2026-01-01T01:00:00Z', 'started', 'still_unknown', 'r', '')",
+        [],
+    ).unwrap();
+
+    let err = conn.execute("DELETE FROM audit_recovery_events WHERE id = 'r2'", []).unwrap_err();
+    assert!(format!("{err:?}").contains("append-only"), "P2-002: DELETE must be rejected by trigger");
+    // Row must still exist.
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM audit_recovery_events WHERE id = 'r2'", [], |row| row.get(0)).unwrap();
+    assert_eq!(count, 1);
+
+    drop(service);
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn p2_002_recovery_insert_allowed() {
+    // P2-002: INSERT must still work (triage path unaffected).
+    let dir = std::env::temp_dir().join(format!(
+        "dbx-bastion-test-{}-{}-p2",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    dbx_bastion::secure_dir::ensure_secure_dir(&dir).unwrap();
+    let db_path = dir.join("bastion.db");
+    let service = BastionService::open(&db_path).expect("open");
+    let conn = Connection::open(&db_path).unwrap();
+
+    conn.execute(
+        "INSERT INTO audit_events (id, user_id, session_id, asset_id, sql_text, sql_hash, action, sql_kind, risk_level, status, started_at)
+         VALUES ('a3', 'u1', 's1', 'asset1', 'SELECT 1', 'hash', 'Select', 'Select', 'Low', 'started', '2026-01-01T00:00:00Z')",
+        [],
+    ).unwrap();
+    // This INSERT must succeed (triggers only block UPDATE/DELETE).
+    conn.execute(
+        "INSERT INTO audit_recovery_events (id, audit_event_id, triaged_by, triaged_at, original_status, conclusion, reason, evidence)
+         VALUES ('r3', 'a3', 'admin1', '2026-01-01T01:00:00Z', 'started', 'confirmed_not_executed', 'verified', 'logs')",
+        [],
+    ).expect("P2-002: INSERT must succeed");
+
+    drop(service);
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ===== P2-004: Migration 0006 -> 0007 -> 0008 regression =====
+
+#[test]
+fn p2_004_migration_chain_preserves_data() {
+    // P2-004: Verify the full 0006 -> 0007 -> 0008 upgrade path.
+    // - audit_events history unchanged
+    // - recovery data complete
+    // - triggers created
+    // - append-only still enforced after restart (re-open)
+    use dbx_bastion::storage::apply_one_migration;
+
+    let dir = std::env::temp_dir().join(format!(
+        "dbx-bastion-test-{}-{}-p2",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    dbx_bastion::secure_dir::ensure_secure_dir(&dir).unwrap();
+    let db_path = dir.join("bastion.db");
+
+    // Start with a fresh DB at 0005 (before recovery tables).
+    // We simulate by opening (which applies all), then verify the chain
+    // works on a DB that already has 0006-era data.
+    //
+    // Simpler deterministic approach: create DB, apply 0001-0006 manually
+    // via apply_one_migration, insert 0006-era data, then open via
+    // BastionService (which applies 0007+0008).
+    let mut conn = Connection::open(&db_path).unwrap();
+    // Create the bookkeeping table (normally done by apply_migrations).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version     TEXT PRIMARY KEY,
+            applied_at  TEXT NOT NULL
+        )",
+    )
+    .unwrap();
+    let migrations: &[(&str, &str)] = &[
+        ("0001_init", include_str!("../migrations/0001_init.sql")),
+        ("0002_auth", include_str!("../migrations/0002_auth.sql")),
+        ("0003_assets", include_str!("../migrations/0003_assets.sql")),
+        ("0004_rbac", include_str!("../migrations/0004_rbac.sql")),
+        ("0005_audit", include_str!("../migrations/0005_audit.sql")),
+        ("0006_audit_recovery", include_str!("../migrations/0006_audit_recovery.sql")),
+    ];
+    for (v, sql) in migrations {
+        apply_one_migration(&mut conn, v, sql).expect("apply migration");
+    }
+
+    // Insert 0006-era data: multiple audit events with recovery rows.
+    // 0006 has UNIQUE(audit_event_id), so one row per event.
+    for i in 0..3 {
+        let aid = format!("audit-{i}");
+        let rid = format!("rec-{i}");
+        conn.execute(
+            "INSERT INTO audit_events (id, user_id, session_id, asset_id, sql_text, sql_hash, action, sql_kind, risk_level, status, started_at)
+             VALUES (?1, 'u1', 's1', 'asset1', 'SELECT 1', 'hash', 'Select', 'Select', 'Low', 'started', '2026-01-01T00:00:00Z')",
+            [&aid],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO audit_recovery_events (id, audit_event_id, triaged_by, triaged_at, original_status, conclusion, reason, evidence)
+             VALUES (?1, ?2, 'admin', '2026-01-01T01:00:00Z', 'started', 'still_unknown', 'r', '')",
+            [&rid, &aid],
+        ).unwrap();
+    }
+    drop(conn);
+
+    // Fix permissions: BastionService::open requires 0600.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // Re-open via BastionService: applies 0007 + 0008.
+    let service = BastionService::open(&db_path).expect("open applies 0007+0008");
+    let conn = Connection::open(&db_path).unwrap();
+
+    // 1. audit_events unchanged (3 rows).
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 3, "P2-004: audit_events must be preserved");
+
+    // 2. Recovery data complete (3 rows, all fields).
+    let rcount: i64 = conn.query_row("SELECT COUNT(*) FROM audit_recovery_events", [], |r| r.get(0)).unwrap();
+    assert_eq!(rcount, 3, "P2-004: recovery rows must be preserved");
+    for i in 0..3 {
+        let aid = format!("audit-{i}");
+        let conclusion: String = conn
+            .query_row("SELECT conclusion FROM audit_recovery_events WHERE audit_event_id = ?1", [&aid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(conclusion, "still_unknown", "P2-004: row {aid} conclusion preserved");
+    }
+
+    // 3. Triggers exist.
+    let tcount: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'audit_recovery_events'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tcount, 2, "P2-004: both append-only triggers must exist");
+
+    // 4. Append-only enforced after re-open (restart simulation).
+    drop(conn);
+    drop(service);
+    let _service2 = BastionService::open(&db_path).expect("re-open");
+    let conn2 = Connection::open(&db_path).unwrap();
+    let err = conn2.execute("DELETE FROM audit_recovery_events", []).unwrap_err();
+    assert!(format!("{err:?}").contains("append-only"), "P2-004: triggers must survive restart");
+
+    drop(conn2);
     let _ = std::fs::remove_dir_all(&dir);
 }
