@@ -93,21 +93,29 @@ pub struct QueryGateway {
 /// RAII guard: removes the audit ID from the in-flight set on drop.
 /// Covers every exit path (success, error, panic, async cancellation)
 /// so an active STARTED is never mistaken for an orphan.
-struct InflightGuard {
+///
+/// P1-1: On mutex poison during cleanup (a panic already occurred while
+/// holding the lock), the ID cannot be safely removed. Instead of
+/// silently leaking, the guard sets the gateway's fail-closed latch:
+/// an explicit safe error state. New SQL is blocked until restart.
+struct InflightGuard<'a> {
     inflight: Arc<std::sync::Mutex<HashSet<Uuid>>>,
     id: Uuid,
+    fail_closed: &'a AtomicBool,
 }
 
-impl Drop for InflightGuard {
+impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        // Reliable cleanup (Issue 3): std::sync::Mutex::lock() works in
-        // Drop (sync context). It blocks briefly if contended, but always
-        // succeeds unless poisoned. On poison (a panic already occurred
-        // while holding the lock), we cannot safely modify the set; the
-        // ID leaks but the audit row remains STARTED/UNKNOWN and
-        // fail_closed_check will block new SQL (fail-closed, not silent).
-        if let Ok(mut guard) = self.inflight.lock() {
-            guard.remove(&self.id);
+        // std::sync::Mutex::lock() works in Drop (sync context). It blocks
+        // briefly if contended, but always succeeds unless poisoned.
+        match self.inflight.lock() {
+            Ok(mut guard) => {
+                guard.remove(&self.id);
+            }
+            Err(_) => {
+                // Poisoned: cannot trust the set. Explicit fail-closed.
+                self.fail_closed.store(true, Ordering::SeqCst);
+            }
         }
     }
 }
@@ -394,17 +402,56 @@ impl QueryGateway {
         //     examines a specific existing ID) cannot race with this
         //     registration. Locks are never nested: SQLite and inflight
         //     are acquired sequentially, never while holding the other.
-        let event = self.audit_event(principal, asset.id, stmt, &sql, &hash, Some("allow".to_string()));
-        let audit_id = self.audit.record_started(event).await.map_err(|e| {
-            // No audit event exists: the executor must see zero calls.
-            // (No inflight registration: the STARTED row does not exist.)
-            BastionError::AuditUnavailable(e.to_string())
-        })?;
-        // 8b. Register in-flight (brief lock, never across await). The
-        //     guard removes the ID on drop, covering every exit path:
-        //     success, error, timeout, abort, panic.
-        self.inflight.lock().map(|mut g| g.insert(audit_id)).ok();
-        let _inflight_guard = InflightGuard { inflight: self.inflight.clone(), id: audit_id };
+        // 8. P1-1: Pre-generate audit_id BEFORE any persistence. Register
+        //     inflight FIRST, then persist STARTED. This closes the race
+        //     where a STARTED row exists but the ID is not in inflight
+        //     (triage would wrongly accept it as an orphan).
+        //
+        //     Lock protocol: the inflight lock is acquired and released
+        //     synchronously here — NEVER held across await or SQLite I/O.
+        //     It is never nested with the SQLite lock (no ABBA).
+        let audit_id = Uuid::new_v4();
+
+        // 8a. Register inflight. Poison -> explicit fail-closed (do NOT
+        //     swallow with .ok(); do NOT proceed to executor).
+        {
+            let mut guard = self.inflight.lock().map_err(|_| {
+                self.fail_closed.store(true, Ordering::SeqCst);
+                BastionError::AuditFailClosed
+            })?;
+            guard.insert(audit_id);
+        } // Lock released here.
+
+        // 8b. RAII guard: releases the registration on every exit path
+        //     (success, error, timeout, abort, panic). On poison during
+        //     Drop, it sets the fail-closed latch (explicit safe state).
+        let _inflight_guard =
+            InflightGuard { inflight: self.inflight.clone(), id: audit_id, fail_closed: &self.fail_closed };
+
+        // 8c. Persist STARTED (SQLite I/O; inflight lock NOT held).
+        //     The executor is NEVER called before this succeeds.
+        let mut event = self.audit_event(principal, asset.id, stmt, &sql, &hash, Some("allow".to_string()));
+        event.id = audit_id;
+        match self.audit.record_started(event).await {
+            Ok(returned_id) => {
+                // Sanity: the service must persist the ID we registered.
+                debug_assert_eq!(returned_id, audit_id);
+            }
+            Err(BastionError::StorageTask(msg)) if msg.contains("join failed") => {
+                // UNCERTAIN: the blocking task did not complete normally;
+                // the row MIGHT have been persisted. Fail-closed (global
+                // latch). Guard drops -> inflight cleaned up.
+                // Never assume the audit does not exist.
+                self.fail_closed.store(true, Ordering::SeqCst);
+                return Err(BastionError::AuditFailClosed);
+            }
+            Err(e) => {
+                // CERTAIN not persisted: single atomic INSERT failed.
+                // Guard drops -> inflight cleaned up. Forbid execution.
+                // No global latch: the audit system itself is healthy.
+                return Err(e);
+            }
+        }
 
         // 9. Deterministic test hook: revoke/disable mid-flight here.
         //     The hook is taken out of the lock before awaiting.

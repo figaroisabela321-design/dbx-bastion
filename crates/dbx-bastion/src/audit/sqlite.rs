@@ -165,6 +165,10 @@ impl AuditService for SqliteAuditService {
             })
             .await
             .map_err(|e| match e {
+                // P1-1: Preserve StorageTask so the gateway can distinguish
+                // "certain not persisted" (closure Err: atomic INSERT failed)
+                // from "uncertain" (join failed: task may have persisted).
+                BastionError::StorageTask(_) => e,
                 BastionError::AuditUnavailable(_) => e,
                 other => BastionError::AuditUnavailable(other.to_string()),
             })?;

@@ -1555,3 +1555,360 @@ async fn t6_triage_active_started_rejected() {
     handle.abort();
     let _ = handle.await;
 }
+
+// ===== P1-1: STARTED/inflight registration race (deterministic) =====
+
+/// Audit wrapper that blocks inside `record_started` until released.
+/// Lets tests observe the exact window: inflight registered, STARTED not
+/// yet persisted.
+struct BlockingAudit {
+    inner: SqliteAuditService,
+    entered: tokio::sync::Notify,
+    proceed: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl AuditService for BlockingAudit {
+    async fn record_started(&self, event: dbx_bastion::audit::AuditEvent) -> dbx_bastion::Result<Uuid> {
+        self.entered.notify_one();
+        self.proceed.notified().await;
+        self.inner.record_started(event).await
+    }
+    async fn record_finished(&self, id: Uuid, outcome: dbx_bastion::audit::AuditOutcome) -> dbx_bastion::Result<()> {
+        self.inner.record_finished(id, outcome).await
+    }
+    async fn list_unfinished(&self) -> dbx_bastion::Result<Vec<dbx_bastion::audit::UnfinishedAudit>> {
+        self.inner.list_unfinished().await
+    }
+    async fn has_untriaged_interruptions(&self) -> dbx_bastion::Result<bool> {
+        self.inner.has_untriaged_interruptions().await
+    }
+}
+
+#[tokio::test]
+async fn p1_01_triage_rejected_before_started_persisted() {
+    // P1-01: inflight registered, STARTED not yet in DB.
+    // Triage must NOT succeed (the query is actively registering).
+    let gw = Gw::new("p1-01").await;
+    gw.grant(Action::Select, "t").await;
+    let blocking = Arc::new(BlockingAudit {
+        inner: SqliteAuditService::new(gw.service.store().clone()),
+        entered: tokio::sync::Notify::new(),
+        proceed: tokio::sync::Notify::new(),
+    });
+    let gateway = Arc::new(QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        blocking.clone() as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    ));
+    gw.executor.set_behavior(MockBehavior::Success {
+        columns: vec!["c".to_string()],
+        rows: vec![],
+        affected_rows: None,
+    });
+
+    let g = gateway.clone();
+    let u = gw.user.clone();
+    let asset_id = gw.asset_id;
+    let handle = tokio::spawn(async move {
+        let req =
+            GatewayRequest { asset_id, sql: "SELECT * FROM appdb.t".to_string(), options: ExecutionOptions::default() };
+        g.execute(&u, req).await
+    });
+
+    // Wait until record_started is entered (inflight already registered).
+    tokio::time::timeout(Duration::from_secs(10), blocking.entered.notified())
+        .await
+        .expect("record_started not entered");
+
+    // The ID must be in inflight.
+    let inflight_id = {
+        let set = gateway.inflight_set();
+        let guard = set.lock().unwrap();
+        guard.iter().next().cloned().expect("ID must be registered before STARTED persists")
+    };
+
+    // Triage must be REJECTED (actively registering/executing).
+    let audit = SqliteAuditService::new(gw.service.store().clone());
+    let err = audit
+        .triage_interruption(
+            inflight_id,
+            Uuid::new_v4(),
+            "p1-01",
+            "evidence",
+            TriageConclusion::ConfirmedNotExecuted,
+            gateway.inflight_set(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("actively executing"),
+        "P1-01: triage must be rejected before STARTED persists, got: {err}"
+    );
+
+    // No STARTED row in DB yet.
+    let unfinished = audit.list_unfinished().await.unwrap();
+    assert!(unfinished.iter().all(|r| r.id != inflight_id), "P1-01: STARTED must not be persisted yet");
+
+    // Release and let it complete.
+    blocking.proceed.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(10), handle).await.expect("execute timeout").expect("task");
+    assert!(result.is_ok(), "P1-01: execute should succeed after release: {result:?}");
+}
+
+#[tokio::test]
+async fn p1_02_triage_rejected_after_started_before_executor() {
+    // P1-02: STARTED persisted, executor not yet started.
+    // Triage must NOT succeed (ID is in inflight).
+    let gw = Gw::new("p1-02").await;
+    gw.grant(Action::Select, "t").await;
+    let gateway = Arc::new(QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(SqliteAuditService::new(gw.service.store().clone())) as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    ));
+    // Hang the executor so we observe the window after STARTED.
+    gw.executor.set_behavior(MockBehavior::Hang);
+
+    let g = gateway.clone();
+    let u = gw.user.clone();
+    let asset_id = gw.asset_id;
+    let handle = tokio::spawn(async move {
+        let req =
+            GatewayRequest { asset_id, sql: "SELECT * FROM appdb.t".to_string(), options: ExecutionOptions::default() };
+        g.execute(&u, req).await
+    });
+
+    // Wait for STARTED row in DB (poll with timeout, deterministic).
+    let audit = SqliteAuditService::new(gw.service.store().clone());
+    let started_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let unfinished = audit.list_unfinished().await.unwrap();
+            if let Some(r) = unfinished.iter().find(|r| matches!(r.status, AuditStatus::Started)) {
+                return r.id;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("STARTED not persisted");
+
+    // The ID must be in inflight (registered before STARTED).
+    assert!(
+        gateway.inflight_set().lock().unwrap().contains(&started_id),
+        "P1-02: ID must be in inflight after STARTED persists"
+    );
+
+    // Triage must be REJECTED.
+    let err = audit
+        .triage_interruption(
+            started_id,
+            Uuid::new_v4(),
+            "p1-02",
+            "evidence",
+            TriageConclusion::ConfirmedNotExecuted,
+            gateway.inflight_set(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("actively executing"),
+        "P1-02: triage must be rejected after STARTED persists, got: {err}"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn p1_03_started_failure_zero_executor_calls() {
+    // P1-03: STARTED write fails -> executor must see zero calls,
+    // inflight must be cleaned up.
+    let gw = Gw::new("p1-03").await;
+    gw.grant(Action::Select, "t").await;
+    // FlakyAudit with fail_started=true.
+    let flaky = Arc::new(FlakyAudit::new(gw.service.store().clone()));
+    flaky.fail_started.store(true, Ordering::SeqCst);
+    let gateway = QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        flaky.clone() as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    );
+
+    let err = gateway
+        .execute(
+            &gw.user,
+            GatewayRequest {
+                asset_id: gw.asset_id,
+                sql: "SELECT * FROM appdb.t".to_string(),
+                options: ExecutionOptions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    // Executor must not have been called.
+    assert_eq!(gw.executor.calls(), 0, "P1-03: executor must see zero calls, got err: {err:?}");
+    // Inflight must be clean (no leak).
+    assert!(
+        gateway.inflight_set().lock().unwrap().is_empty(),
+        "P1-03: inflight must be cleaned up after STARTED failure"
+    );
+}
+
+/// Audit service that simulates an UNCERTAIN STARTED write
+/// (spawn_blocking JoinError: row might have been persisted).
+struct UncertainAudit {
+    inner: SqliteAuditService,
+}
+
+#[async_trait::async_trait]
+impl AuditService for UncertainAudit {
+    async fn record_started(&self, _event: dbx_bastion::audit::AuditEvent) -> dbx_bastion::Result<Uuid> {
+        Err(BastionError::StorageTask("storage task join failed: simulated panic".to_string()))
+    }
+    async fn record_finished(&self, id: Uuid, outcome: dbx_bastion::audit::AuditOutcome) -> dbx_bastion::Result<()> {
+        self.inner.record_finished(id, outcome).await
+    }
+    async fn list_unfinished(&self) -> dbx_bastion::Result<Vec<dbx_bastion::audit::UnfinishedAudit>> {
+        self.inner.list_unfinished().await
+    }
+    async fn has_untriaged_interruptions(&self) -> dbx_bastion::Result<bool> {
+        self.inner.has_untriaged_interruptions().await
+    }
+}
+
+#[tokio::test]
+async fn p1_04_uncertain_started_fail_closed() {
+    // P1-04: STARTED write result uncertain -> global fail-closed latch.
+    // The gateway must NOT assume the audit does not exist.
+    let gw = Gw::new("p1-04").await;
+    gw.grant(Action::Select, "t").await;
+    let gateway = QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(UncertainAudit { inner: SqliteAuditService::new(gw.service.store().clone()) })
+            as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    );
+
+    let err = gateway
+        .execute(
+            &gw.user,
+            GatewayRequest {
+                asset_id: gw.asset_id,
+                sql: "SELECT * FROM appdb.t".to_string(),
+                options: ExecutionOptions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("AuditFailClosed") || msg.contains("fail"),
+        "P1-04: uncertain write must fail-closed, got: {msg}"
+    );
+    assert_eq!(gw.executor.calls(), 0, "P1-04: executor must not be called");
+    // Subsequent queries must also be blocked (latch is set).
+    let err2 = gateway
+        .execute(
+            &gw.user,
+            GatewayRequest {
+                asset_id: gw.asset_id,
+                sql: "SELECT * FROM appdb.t".to_string(),
+                options: ExecutionOptions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{err2:?}").contains("AuditFailClosed"), "P1-04: latch must persist, got: {err2:?}");
+}
+
+#[tokio::test]
+async fn p1_05_abort_leaves_no_active_ids() {
+    // P1-05: After abort, the specific ID must be gone from inflight.
+    // (No erroneous "active" IDs that would mask orphans or block triage.)
+    let gw = Gw::new("p1-05").await;
+    gw.grant(Action::Select, "t").await;
+    let gateway = Arc::new(QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(SqliteAuditService::new(gw.service.store().clone())) as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    ));
+    gw.executor.set_behavior(MockBehavior::Hang);
+
+    let g = gateway.clone();
+    let u = gw.user.clone();
+    let asset_id = gw.asset_id;
+    let handle = tokio::spawn(async move {
+        let req =
+            GatewayRequest { asset_id, sql: "SELECT * FROM appdb.t".to_string(), options: ExecutionOptions::default() };
+        g.execute(&u, req).await
+    });
+
+    // Wait for the ID to be registered (deterministic: poll with timeout).
+    let registered_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let id = gateway.inflight_set().lock().unwrap().iter().next().cloned();
+            if let Some(id) = id {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("ID not registered");
+
+    handle.abort();
+    let _ = handle.await;
+    // Allow Drop to run.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let set = gateway.inflight_set();
+    let guard = set.lock().unwrap();
+    assert!(!guard.contains(&registered_id), "P1-05: aborted ID must not remain active");
+    assert!(guard.is_empty(), "P1-05: inflight must be empty after abort");
+}
+
+#[tokio::test]
+async fn p1_06_poisoned_mutex_blocks_execution() {
+    // P1-06: If the inflight mutex is poisoned, execute must fail
+    // WITHOUT calling the executor (no unregistered SQL execution).
+    let gw = Gw::new("p1-06").await;
+    gw.grant(Action::Select, "t").await;
+    let gateway = QueryGateway::new(
+        gw.service.store().clone(),
+        Arc::new(SystemClock),
+        Arc::new(SqliteAuditService::new(gw.service.store().clone())) as Arc<dyn AuditService>,
+        gw.executor.clone() as Arc<dyn QueryExecutor>,
+    );
+
+    // Poison the mutex: panic while holding the lock in another thread.
+    let inflight = gateway.inflight_set();
+    let poisoner = std::thread::spawn(move || {
+        let _guard = inflight.lock().unwrap();
+        panic!("intentional poison for P1-06");
+    });
+    let _ = poisoner.join(); // Returns Err, mutex is now poisoned.
+
+    let err = gateway
+        .execute(
+            &gw.user,
+            GatewayRequest {
+                asset_id: gw.asset_id,
+                sql: "SELECT * FROM appdb.t".to_string(),
+                options: ExecutionOptions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("AuditFailClosed") || msg.contains("fail"),
+        "P1-06: poisoned mutex must block execution, got: {msg}"
+    );
+    assert_eq!(gw.executor.calls(), 0, "P1-06: executor must not be called with poisoned mutex");
+}
